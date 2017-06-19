@@ -23,7 +23,6 @@
 #include "fnv1a.h"
 #include "md5.h"
 #include "server.h"
-#include "allocator.h"
 
 #define CH_RING struct _ch_ring
 #include "consistent-hash.h"
@@ -37,14 +36,16 @@
 
 typedef struct _ring_entry {
 	unsigned short pos;
+	unsigned char malloced:1;
 	server *server;
+	struct _ring_entry *next;
 } ch_ring_entry;
 
 struct _ch_ring {
 	ch_type type;
 	unsigned char hash_replicas;
-	ch_ring_entry *entrylist;
-	int entrysize;
+	ch_ring_entry *entries;
+	ch_ring_entry **entrylist;  /* only used with jump hash */
 	int entrycnt;
 };
 
@@ -88,7 +89,6 @@ jump_bucketpos(unsigned long long int key, int bckcnt)
 {
 	long long int b = -1, j = 0;
 
-	assert(bckcnt > 0);  /* help static code analysis */
 	while (j < bckcnt) {
 		b = j;
 		key = key * 2862933555777941757ULL + 1;
@@ -164,36 +164,17 @@ entrycmp_fnv1a(const void *l, const void *r)
 static int
 entrycmp_jump_fnv1a(const void *l, const void *r)
 {
-	ch_ring_entry *ch_l = (ch_ring_entry *)l;
-	ch_ring_entry *ch_r = (ch_ring_entry *)r;
+	char *si_l = server_instance(((ch_ring_entry *)l)->server);
+	char *si_r = server_instance(((ch_ring_entry *)r)->server);
 
-	char *si_l = server_instance(ch_l->server);
-	char *si_r = server_instance(ch_r->server);
-
-	/* order such that servers with explicit instance come first
-	 * (sorted), all servers without instance follow in order of their
-	 * definition in the config file (as per documentation) */
-	if (si_l == NULL && si_r == NULL)
-		return ch_l->pos - ch_r->pos;
-	if (si_l == NULL)
-		return 1;
-	if (si_r == NULL)
-		return -1;
-	return strcmp(si_l, si_r);
+	return strcmp(si_l ? si_l : "", si_r ? si_r : "");
 }
 
 ch_ring *
-ch_new(allocator *a, ch_type type, int servercnt)
+ch_new(ch_type type)
 {
-	ch_ring *ret;
+	ch_ring *ret = malloc(sizeof(ch_ring));
 
-	if (servercnt > CONN_DESTS_SIZE) {
-		logerr("ch_addnode: nodes in use exceeds CONN_DESTS_SIZE, "
-				"increase CONN_DESTS_SIZE in router.h\n");
-		return NULL;
-	}
-
-	ret = ra_malloc(a, sizeof(ch_ring));
 	if (ret == NULL)
 		return NULL;
 	ret->type = type;
@@ -206,13 +187,9 @@ ch_new(allocator *a, ch_type type, int servercnt)
 			ret->hash_replicas = 1;
 			break;
 	}
+	ret->entries = NULL;
+	ret->entrylist = NULL;
 	ret->entrycnt = 0;
-	ret->entrysize = ret->hash_replicas * servercnt;
-	ret->entrylist = ra_malloc(a, sizeof(ch_ring_entry) * ret->entrysize);
-	if (ret->entrylist == NULL) {
-		free(ret);
-		return NULL;
-	}
 
 	return ret;
 }
@@ -223,7 +200,7 @@ ch_new(allocator *a, ch_type type, int servercnt)
  * address.  The port component is just stored and not used in the
  * carbon hash calculation in case of carbon_ch.  The instance component
  * is used in the hash calculation of carbon_ch, it is ignored for
- * fnv1a_ch.  Returns an updated ring once the last server is added.
+ * fnv1a_ch.  Returns an updated ring.
  */
 ch_ring *
 ch_addnode(ch_ring *ring, server *s)
@@ -236,7 +213,11 @@ ch_addnode(ch_ring *ring, server *s)
 
 	if (ring == NULL)
 		return NULL;
-	entries = &ring->entrylist[ring->entrycnt];
+
+	entries =
+		(ch_ring_entry *)malloc(sizeof(ch_ring_entry) * ring->hash_replicas);
+	if (entries == NULL)
+		return NULL;
 
 	switch (ring->type) {
 		case CARBON:
@@ -257,6 +238,8 @@ ch_addnode(ch_ring *ring, server *s)
 				 * https://github.com/grobian/carbon-c-relay/issues/84 */
 				entries[i].pos = carbon_hashpos(buf, buf + strlen(buf));
 				entries[i].server = s;
+				entries[i].next = NULL;
+				entries[i].malloced = 0;
 			}
 			cmp = *entrycmp_carbon;
 			break;
@@ -273,19 +256,79 @@ ch_addnode(ch_ring *ring, server *s)
 				}
 				entries[i].pos = fnv1a_hashpos(buf, buf + strlen(buf));
 				entries[i].server = s;
+				entries[i].next = NULL;
+				entries[i].malloced = 0;
 			}
 			cmp = *entrycmp_fnv1a;
 			break;
 		case JUMP_FNV1a:
-			entries[0].pos = ring->entrycnt;
+			entries[0].pos = 0;
 			entries[0].server = s;
+			entries[0].next = NULL;
+			entries[0].malloced = 0;
 			cmp = *entrycmp_jump_fnv1a;
 			break;
 	}
 
-	ring->entrycnt += ring->hash_replicas;
-	if (ring->entrycnt == ring->entrysize)
-		qsort(&ring->entrylist[0], ring->entrycnt, sizeof(ch_ring_entry), cmp);
+	/* sort to allow merge joins later down the road */
+	qsort(entries, ring->hash_replicas, sizeof(ch_ring_entry), cmp);
+	entries[0].malloced = 1;
+
+	if (ring->entries == NULL) {
+		for (i = 1; i < ring->hash_replicas; i++)
+			entries[i - 1].next = &entries[i];
+		ring->entries = entries;
+	} else {
+		/* merge-join the two rings */
+		ch_ring_entry *w, *last;
+		i = 0;
+		last = NULL;
+		assert(ring->hash_replicas > 0);
+		for (w = ring->entries; w != NULL && i < ring->hash_replicas; ) {
+			if (cmp(w, &entries[i]) <= 0) {
+				last = w;
+				w = w->next;
+			} else {
+				entries[i].next = w;
+				if (last == NULL) {
+					ring->entries = &entries[i];
+				} else {
+					last->next = &entries[i];
+				}
+				last = &entries[i];
+				i++;
+			}
+		}
+		if (w != NULL) {
+			last->next = w;
+		} else {
+			last->next = &entries[i];
+			for (i = i + 1; i < ring->hash_replicas; i++)
+				entries[i - 1].next = &entries[i];
+		}
+	}
+
+	if (ring->type == JUMP_FNV1a) {
+		ch_ring_entry *w;
+
+		/* count the ring, pos is purely cosmetic, it isn't used */
+		for (w = ring->entries, i = 0; w != NULL; w = w->next, i++)
+			w->pos = i;
+		ring->entrycnt = i;
+		/* this is really wasteful, but optimising this isn't worth it
+		 * since it's called only a few times during config parsing */
+		if (ring->entrylist != NULL)
+			free(ring->entrylist);
+		ring->entrylist = malloc(sizeof(ch_ring_entry *) * ring->entrycnt);
+		for (w = ring->entries, i = 0; w != NULL; w = w->next, i++)
+			ring->entrylist[i] = w;
+
+		if (i == CONN_DESTS_SIZE) {
+			logerr("ch_addnode: nodes in use exceeds CONN_DESTS_SIZE, "
+					"increase CONN_DESTS_SIZE in router.h\n");
+			return NULL;
+		}
+	}
 
 	return ring;
 }
@@ -305,8 +348,9 @@ ch_get_nodes(
 		const char *metric,
 		const char *firstspace)
 {
+	ch_ring_entry *w;
 	unsigned short pos = 0;
-	int i, j, t;
+	int i, j;
 
 	switch (ring->type) {
 		case CARBON:
@@ -319,20 +363,19 @@ ch_get_nodes(
 			/* this is really a short route, since the jump hash gives
 			 * us a bucket immediately */
 			unsigned long long int hash;
-			server *bcklst[CONN_DESTS_SIZE];
+			ch_ring_entry *bcklst[CONN_DESTS_SIZE];
 			const char *p;
 
+			i = ring->entrycnt;
 			pos = replcnt;
 
-			/* we know this fits, since ch_new checks i <= CONN_DESTS_SIZE */
-			for (i = 0; i < ring->entrycnt; i++)
-				bcklst[i] = ring->entrylist[i].server;
+			memcpy(bcklst, ring->entrylist, sizeof(bcklst[0]) * i);
 			fnv1a_64(hash, p, metric, firstspace);
 
 			while (i > 0) {
 				j = jump_bucketpos(hash, i);
 
-				(*ret).dest = bcklst[j];
+				(*ret).dest = bcklst[j]->server;
 				(*ret).metric = strdup(metric);
 				ret++;
 
@@ -340,7 +383,7 @@ ch_get_nodes(
 					break;
 
 				/* use xorshift to generate a different hash for input
-				 * in the jump hash again */
+				 * in the hump hash again */
 				hash ^= hash >> 12;
 				hash ^= hash << 25;
 				hash ^= hash >> 27;
@@ -353,47 +396,20 @@ ch_get_nodes(
 		}	return;
 	}
 
-	assert(ring->entrylist);
+	assert(ring->entries);
 
-	/* binary search for first entry.pos >= pos */
-	i = 0;
-	j = ring->entrycnt;
-	t = 0;
-	while (1) {
-		t = ((j - i) / 2) + i;
-		if (ring->entrylist[t].pos == pos)
-			break;  /* exact match */
-		if (ring->entrylist[t].pos < pos) {
-			i = t;  /* left is smaller, search right */
-			if (i == j - 1) {
-				if (ring->entrylist[j].pos < pos) {
-					t = j + 1;
-					break;  /* right pos is smaller than the value */
-				} else {
-					t = j;
-					break;  /* right pos is the first bigger value */
-				}
-			}
-		} else {
-			j = t;  /* right is bigger, search left */
-			if (i == j - 1) {
-				if (ring->entrylist[i].pos >= pos) {
-					t = i;
-					break;  /* left pos is the first bigger than value */
-				} else {
-					t = j;
-					break;  /* right pos is the first bigger value */
-				}
-			}
-		}
-	}
-
+	/* implement behaviour of Python's bisect_left on the ring (used in
+	 * carbon hash source), one day we might want to implement it as
+	 * real binary search iso forward pointer chasing */
+	for (w = ring->entries, i = 0; w != NULL; i++, w = w->next)
+		if (w->pos >= pos)
+			break;
 	/* now fetch enough unique servers to match the requested count */
-	for (i = 0; i < replcnt; i++, t++) {
-		if (t >= ring->entrycnt)
-			t = 0;
+	for (i = 0; i < replcnt; i++, w = w->next) {
+		if (w == NULL)
+			w = ring->entries;
 		for (j = i - 1; j >= 0; j--) {
-			if (ret[j].dest == ring->entrylist[t].server) {
+			if (ret[j].dest == w->server) {
 				j = i;
 				break;
 			}
@@ -402,7 +418,7 @@ ch_get_nodes(
 			i--;
 			continue;
 		}
-		ret[i].dest = ring->entrylist[t].server;
+		ret[i].dest = w->server;
 		ret[i].metric = strdup(metric);
 	}
 }
@@ -413,10 +429,8 @@ ch_printhashring(ch_ring *ring, FILE *f)
 	ch_ring_entry *w;
 	char column = 0;
 	char srvbuf[21];
-	int i;
 
-	for (i = 0; i < ring->entrycnt; i++) {
-		w = &ring->entrylist[i];
+	for (w = ring->entries; w != NULL; w = w->next) {
 		snprintf(srvbuf, sizeof(srvbuf), "%s:%d%s%s",
 				server_ip(w->server),
 				server_port(w->server),
@@ -453,4 +467,39 @@ ch_gethashpos(ch_ring *ring, const char *key, const char *end)
 	}
 
 	return 0;  /* pacify compiler */
+}
+
+/**
+ * Frees the ring structure and its added nodes, leaves the referenced
+ * servers untouched.
+ */
+void
+ch_free(ch_ring *ring)
+{
+	ch_ring_entry *deletes = NULL;
+	ch_ring_entry *w = NULL;
+
+	for (; ring->entries != NULL; ring->entries = ring->entries->next) {
+		if (ring->entries->malloced) {
+			if (deletes == NULL) {
+				w = deletes = ring->entries;
+			} else {
+				w = w->next = ring->entries;
+			}
+		}
+	}
+
+	if (w != NULL) {
+		w->next = NULL;
+		while (deletes != NULL) {
+			w = deletes->next;
+			free(deletes);
+			deletes = w;
+		}
+	}
+
+	if (ring->entrylist != NULL)
+		free(ring->entrylist);
+
+	free(ring);
 }

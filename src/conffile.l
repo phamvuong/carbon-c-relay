@@ -23,10 +23,10 @@ int identstate = 0;
 %option noinput
 %option nounput
 
-%x cl ma re ag se st li qu
-%x idcl idma idag idin idli
+%x cl ma re ag se st qu
+%x idcl idma idag idin
 
-IDCHR	[a-zA-Z0-9[\](){}|\\^?*$&%<>:/,._+-]
+IDCHR	[a-zA-Z0-9[\](){}|\\^?*$&:/,._+-]
 
 %%
 
@@ -95,16 +95,7 @@ match				{
 <ma>else				return crELSE;
 <ma>log					return crLOG;
 <ma>drop				return crDROP;
-<ma,idma>route		{
-						BEGIN(ma);
-						return crROUTE;
-					}
-<ma>using			{	
-						identstate = ma;
-						BEGIN(idma);
-						return crUSING;
-					}
-<ma,idma>send		{
+<ma,idma>send			{
 						BEGIN(ma);
 						return crSEND;
 					}
@@ -210,36 +201,6 @@ statistics			{
 						return crSEND;
 					}
 
-listen				{
-						BEGIN(li);
-						return crLISTEN;
-					}
-<li>linemode		{
-						identstate = li;
-						BEGIN(idli);
-						return crLINEMODE;
-					}
-<idli>gzip				return crGZIP;
-<idli>bzip2				return crBZIP2;
-<idli>lzma				return crLZMA;
-<idli>ssl				return crSSL;
-<li>proto				return crPROTO;
-<li>udp				{
-						identstate = li;
-						BEGIN(idli);
-						return crUDP;
-					}
-<li>tcp				{
-						identstate = li;
-						BEGIN(idli);
-						return crTCP;
-					}
-<li>unix			{
-						identstate = li;
-						BEGIN(idli);
-						return crUNIX;
-					}
-
 include				{
 						identstate = INITIAL;
 						BEGIN(idin);
@@ -247,7 +208,7 @@ include				{
 					}
 
 	/* handle quoted strings */
-<idcl,idma,idag,idin,idli>\"	{
+<idcl,idma,idag,idin>\"		{
 						strbuf = string_buf;
 						BEGIN(qu);
 					}
@@ -309,7 +270,7 @@ include				{
 						yylval_param->crINTVAL = atoi(yytext);
 						return crINTVAL;
 					}
-<idcl,idma,idag,idin,idli>{IDCHR}+(\\[ ]{IDCHR}+)*	{
+<idcl,idma,idag,idin>{IDCHR}+(\\[ ]{IDCHR}+)*	{
 						yylval_param->crSTRING = ra_strdup(palloc, yytext);
 						BEGIN(identstate);
 						return crSTRING;

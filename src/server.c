@@ -245,7 +245,7 @@ server_queuereader(void *d)
 				 * whatever we have such that resolution errors incurred
 				 * after starting the relay won't make it fail */
 				snprintf(sport, sizeof(sport), "%u", self->port);
-				if (getaddrinfo(self->ip, sport, self->hint, &saddr) == 0) {
+				if (getaddrinfo(self->ip, sport, self->hint, &saddr) != 0) {
 					freeaddrinfo(self->saddr);
 					self->saddr = saddr;
 				}
@@ -294,11 +294,7 @@ server_queuereader(void *d)
 						self->fd = -1;
 						continue;
 					}
-
-					/* we made it up here, so this connection is usable */
-					break;
 				}
-				/* if all addrinfos failed, try again later */
 				if (self->fd < 0)
 					continue;
 			} else {  /* CON_TCP */
@@ -364,8 +360,7 @@ server_queuereader(void *d)
 										__sync_fetch_and_add(
 											&(self->failure), 1) == 0)
 									logerr("failed to connect() for %s:%u: "
-											"Connection refused\n",
-											self->ip, self->port);
+											"Hangup\n", self->ip, self->port);
 								close(self->fd);
 								self->fd = -1;
 								continue;
@@ -386,8 +381,8 @@ server_queuereader(void *d)
 
 					/* make socket blocking again */
 					if (fcntl(self->fd, F_SETFL, args) < 0) {
-						logerr("failed to remove socket non-blocking "
-								"mode: %s\n", strerror(errno));
+						logerr("failed to remove socket non-blocking mode: %s\n",
+								strerror(errno));
 						close(self->fd);
 						self->fd = -1;
 						continue;
@@ -398,12 +393,7 @@ server_queuereader(void *d)
 					if (setsockopt(self->fd, IPPROTO_TCP, TCP_NODELAY,
 								&args, sizeof(args)) != 0)
 						; /* ignore */
-
-					/* if we reached up here, we're good to go, so don't
-					 * continue with the other addrinfos */
-					break;
 				}
-				/* all available addrinfos failed on us */
 				if (self->fd < 0)
 					continue;
 			}
@@ -598,46 +588,6 @@ server_new(
 	ret->tid = 0;
 
 	return ret;
-}
-
-/**
- * Compare server s against the address info in saddr.  A server is
- * considered to be equal is it is of the same socket family, type and
- * protocol, and if the target address and port are the same.  When
- * saddr is NULL, a match against the given ip is attempted, e.g. for
- * file destinations.
- */
-char
-server_cmp(server *s, struct addrinfo *saddr, const char *ip)
-{
-	if ((saddr == NULL || s->saddr == NULL)) {
-		if (strcmp(s->ip, ip) == 0)
-			return 0;
-	} else if (
-			s->saddr->ai_family == saddr->ai_family &&
-			s->saddr->ai_socktype == saddr->ai_socktype &&
-			s->saddr->ai_protocol == saddr->ai_protocol
-	   )
-	{
-		if (saddr->ai_family == AF_INET) {
-			struct sockaddr_in *l = ((struct sockaddr_in *)s->saddr->ai_addr);
-			struct sockaddr_in *r = ((struct sockaddr_in *)saddr->ai_addr);
-			if (l->sin_port == r->sin_port &&
-					l->sin_addr.s_addr == r->sin_addr.s_addr)
-				return 0;
-		} else if (saddr->ai_family == AF_INET6) {
-			struct sockaddr_in6 *l =
-				((struct sockaddr_in6 *)s->saddr->ai_addr);
-			struct sockaddr_in6 *r =
-				((struct sockaddr_in6 *)saddr->ai_addr);
-			if (l->sin6_port == r->sin6_port &&
-					memcmp(l->sin6_addr.s6_addr, r->sin6_addr.s6_addr,
-						sizeof(l->sin6_addr.s6_addr)) == 0)
-				return 0;
-		}
-	}
-
-	return 1;  /* not equal */
 }
 
 /**

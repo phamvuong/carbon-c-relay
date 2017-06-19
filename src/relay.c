@@ -21,7 +21,6 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <string.h>
-#include <ctype.h>
 #include <signal.h>
 #include <time.h>
 #include <errno.h>
@@ -51,7 +50,6 @@ static int batchsize = 2500;
 static int queuesize = 25000;
 static int maxstalls = 4;
 static unsigned short iotimeout = 600;
-static unsigned short listenport = GRAPHITE_PORT;
 static int optimiserthreshold = 50;
 static int sockbufsize = 0;
 static int collector_interval = 60;
@@ -99,9 +97,7 @@ relaylog(enum logdst dest, const char *fmt, ...)
 				console = 1;
 			break;
 	}
-	/* NULL == /dev/null */
-	if (dst == NULL)
-		return 0;
+	assert(dst != NULL);
 
 	time(&now);
 	localtime_r(&now, &tm_now);
@@ -139,7 +135,6 @@ do_reload(void)
 	int id;
 	FILE *newfd;
 	size_t numaggregators;
-	listener *lsnrs;
 
 	if (relay_stderr != stderr) {
 		/* try to re-open the file first, so we can still try and say
@@ -161,9 +156,18 @@ do_reload(void)
 	}
 
 	logout("reloading config from '%s'\n", config);
-	if ((newrtr = router_readconfig(NULL, config, workercnt,
+	/* hack to set defaults from command line flags */
+	if ((newrtr = router_readconfig(NULL, "/dev/null",
 					queuesize, batchsize, maxstalls,
-					iotimeout, sockbufsize, listenport)) == NULL)
+					iotimeout, sockbufsize)) == NULL)
+	{
+		logerr("failed to create router configuration\n");
+		return;
+	}
+	router_set_collectorvals(newrtr, collector_interval, NULL, smode);
+	if ((newrtr = router_readconfig(newrtr, config,
+					queuesize, batchsize, maxstalls,
+					iotimeout, sockbufsize)) == NULL)
 	{
 		logerr("failed to read configuration '%s', aborting reload\n", config);
 		return;
@@ -178,15 +182,6 @@ do_reload(void)
 		router_free(newrtr);
 		logout("SIGHUP handler complete\n");
 		return;
-	}
-
-	/* close connections that are not in the new config first */
-	lsnrs = router_get_listeners(rtr);
-	for ( ; lsnrs != NULL; lsnrs = lsnrs->next) {
-		if (!router_contains_listener(newrtr, lsnrs)) {
-			dispatch_removelistener(lsnrs);
-			shutdownclose(lsnrs);
-		}
 	}
 
 	logout("reloading collector\n");
@@ -250,22 +245,6 @@ do_reload(void)
 	for (id = 1; id < 1 + workercnt; id++) {
 		while (!dispatch_reloadcomplete(workers[id + 0]))
 			usleep((100 + (rand() % 200)) * 1000);  /* 100ms - 300ms */
-	}
-
-	/* open connections that are in the new config */
-	lsnrs = router_get_listeners(newrtr);
-	for ( ; lsnrs != NULL; lsnrs = lsnrs->next) {
-		if (!router_contains_listener(rtr, lsnrs)) {
-			if (bindlisten(lsnrs, 32 /* FIXME */) != 0) {
-				logerr("failed to setup listener, "
-						"this will impact the behaviour of the relay\n");
-				continue;
-			}
-			if (dispatch_addlistener(lsnrs) != 0) {
-				logerr("failed to listen to socket, the "
-						"listener will not be effective\n");
-			}
-		}
 	}
 
 	router_free(rtr);
@@ -340,8 +319,8 @@ do_usage(char *name, int exitcode)
 	printf("Options:\n");
 	printf("  -v  print version and exit\n");
 	printf("  -f  read <config> for clusters and routes\n");
-	printf("  -p  listen on <port> for connections, defaults to %u\n",
-			GRAPHITE_PORT);
+	printf("  -p  listen on <port> for connections, defaults to 2003\n");
+	printf("  -i  listen on <interface> for connections, defaults to all\n");
 	printf("  -l  write output to <file>, defaults to stdout/stderr\n");
 	printf("  -w  use <workers> worker threads, defaults to %d\n", get_cores());
 	printf("  -b  server send batch size, defaults to %d\n", batchsize);
@@ -349,7 +328,6 @@ do_usage(char *name, int exitcode)
 	printf("  -L  server max stalls, defaults to %d\n", maxstalls);
 	printf("  -S  statistics sending interval in seconds, defaults to 60\n");
 	printf("  -B  connection listen backlog, defaults to 32\n");
-	printf("  -U  socket receive buffer size, max/min/default values depend on OS\n");
 	printf("  -T  IO timeout in milliseconds for server connections, defaults to %d\n", iotimeout);
 	printf("  -m  send statistics like carbon-cache.py, e.g. not cumulative\n");
 	printf("  -c  characters to allow next to [A-Za-z0-9], defaults to -_:#\n");
@@ -369,22 +347,25 @@ do_usage(char *name, int exitcode)
 int
 main(int argc, char * const argv[])
 {
+	int stream_sock[] = {0, 0, 0};  /* tcp4, tcp6, UNIX */
+	int stream_socklen = sizeof(stream_sock) / sizeof(stream_sock[0]);
+	int dgram_sock[] = {0, 0};  /* udp4, udp6 */
+	int dgram_socklen = sizeof(dgram_sock) / sizeof(dgram_sock[0]);
 	char id;
+	unsigned short listenport = 2003;
 	unsigned int listenbacklog = 32;
 	int ch;
 	size_t numaggregators;
+	char *listeninterface = NULL;
 	char *allowed_chars = NULL;
 	char *pidfile = NULL;
 	FILE *pidfile_handle = NULL;
 	aggregator *aggrs = NULL;
-	int fds[2];
-	unsigned char startup_success = 0;
-	listener *lsnrs;
 
 	if (gethostname(relay_hostname, sizeof(relay_hostname)) < 0)
 		snprintf(relay_hostname, sizeof(relay_hostname), "127.0.0.1");
 
-	while ((ch = getopt(argc, argv, ":hvdstf:l:p:w:b:q:L:T:c:H:B:U:DP:O:")) != -1) {
+	while ((ch = getopt(argc, argv, ":hvdmstf:i:l:p:w:b:q:L:S:T:c:H:B:U:DP:O:")) != -1) {
 		switch (ch) {
 			case 'v':
 				do_version();
@@ -399,19 +380,23 @@ main(int argc, char * const argv[])
 					mode |= MODE_DEBUG;
 				}
 				break;
+			case 'm':
+				smode = SUB;
+				fprintf(stderr, "warning: -m flag will be removed in a "
+						"future version, set the summary mode from the "
+						"config instead\n");
+				break;
 			case 's':
 				mode |= MODE_SUBMISSION;
 				break;
 			case 't':
-				/* -t: test interactively, -tt: test config and exit */
-				if (mode & MODE_TEST) {
-					mode |= MODE_CONFIGTEST;
-				} else {
-					mode |= MODE_TEST;
-				}
+				mode |= MODE_TEST;
 				break;
 			case 'f':
 				config = optarg;
+				break;
+			case 'i':
+				listeninterface = optarg;
 				break;
 			case 'l':
 				relay_logfile = optarg;
@@ -451,6 +436,17 @@ main(int argc, char * const argv[])
 							"between 0 and %d\n", (1 << SERVER_STALL_BITS) - 1);
 					do_usage(argv[0], 1);
 				}
+				break;
+			case 'S':
+				collector_interval = atoi(optarg);
+				if (collector_interval <= 0) {
+					fprintf(stderr, "error: sending interval needs to be "
+							"a number >0\n");
+					do_usage(argv[0], 1);
+				}
+				fprintf(stderr, "warning: -S flag will be removed in a "
+						"future version, set the interval from the "
+						"config instead\n");
 				break;
 			case 'T': {
 				int val = atoi(optarg);
@@ -511,7 +507,7 @@ main(int argc, char * const argv[])
 					exit(1);
 				}
 				if (sockbufsize != (unsigned int)val)
-					fprintf(stderr, "warning: OS rejected socket bufsize\n");
+					fprintf(stdout, "warning: OS rejected socket bufsize\n");
 				if (sock != -1)
 					close(sock);
 			}	break;
@@ -545,14 +541,10 @@ main(int argc, char * const argv[])
 	if (workercnt == 0)
 		workercnt = mode & MODE_SUBMISSION ? 2 : get_cores();
 
-	/* disable collector for submission mode */
-	if (mode & MODE_SUBMISSION)
-		collector_interval = 0;
-
 	/* any_of failover maths need batchsize to be smaller than queuesize */
 	if (batchsize > queuesize) {
 		fprintf(stderr, "error: batchsize must be smaller than queuesize\n");
-		exit(1);
+		exit(-1);
 	}
 
 	if (relay_logfile != NULL && (mode & MODE_TEST) == 0) {
@@ -560,14 +552,10 @@ main(int argc, char * const argv[])
 		if (f == NULL) {
 			fprintf(stderr, "error: failed to open logfile '%s': %s\n",
 					relay_logfile, strerror(errno));
-			exit(1);
+			exit(-1);
 		}
 		relay_stdout = f;
 		relay_stderr = f;
-	} else if (mode & MODE_CONFIGTEST) {
-		/* suppress stdout, just show errors */
-		relay_stdout = NULL;
-		relay_stderr = stderr;
 	} else {
 		relay_stdout = stdout;
 		relay_stderr = stderr;
@@ -578,13 +566,13 @@ main(int argc, char * const argv[])
 		if (relay_logfile == NULL) {
 			fprintf(stderr,
 					"You must specify logfile if you want daemonisation!\n");
-			exit(1);
+			exit(-1);
 		}
 
 		if (mode & MODE_TEST) {
 			fprintf(stderr,
 					"You cannot use test mode if you want daemonisation!\n");
-			exit(1);
+			exit(-1);
 		}
 	}
 
@@ -593,12 +581,13 @@ main(int argc, char * const argv[])
 		if (pidfile_handle == NULL) {
 			fprintf(stderr, "failed to open pidfile '%s': %s\n",
 					pidfile, strerror(errno));
-			exit(1);
+			exit(-1);
 		}
 	}
 
 	if (mode & MODE_DAEMON) {
 		pid_t p;
+		int fds[2];
 
 		if (pipe(fds) < 0) {
 			fprintf(stderr, 
@@ -614,19 +603,19 @@ main(int argc, char * const argv[])
 			exit(1);
 		} else if (p == 0) {
 			char msg[1024];
-			/* child, fork again so our intermediate process can die and
+			/* child, for again so our intermediate process can die and
 			 * its child becomes an orphan to init */
 			p = fork();
 			if (p < 0) {
-				snprintf(msg, sizeof(msg),
-						"failed to fork daemon process: %s\n", strerror(errno));
+				snprintf(msg, sizeof(msg), "failed to fork daemon process: %s",
+						strerror(errno));
 				/* fool compiler */
 				if (write(fds[1], msg, strlen(msg) + 1) > -2)
 					exit(1); /* not that retcode matters */
 			} else if (p == 0) {
 				/* child, this is the final daemon process */
 				if (setsid() < 0) {
-					snprintf(msg, sizeof(msg), "failed to setsid(): %s\n",
+					snprintf(msg, sizeof(msg), "failed to setsid(): %s",
 							strerror(errno));
 					/* fool compiler */
 					if (write(fds[1], msg, strlen(msg) + 1) > -2)
@@ -637,6 +626,11 @@ main(int argc, char * const argv[])
 				close(0);
 				close(1);
 				close(2);
+
+				/* we're fine, flag our grandparent (= the original
+				 * process being called) it can terminate */
+				if (write(fds[1], "OK", 3) < -2)
+					*msg = '\0';  /* unreachable dummy to fool compiler */
 			} else {
 				/* parent, die */
 				exit(0);
@@ -660,35 +654,14 @@ main(int argc, char * const argv[])
 				if (len == 1024)
 					len--;
 				msg[len] = '\0';
-				fprintf(stderr, "%s", msg);
+				fprintf(stderr, "%s\n", msg);
 				exit(1);
 			}
 		}
-	} else {
-		fds[0] = fds[1] = -1;
+
+		close(fds[0]);
+		close(fds[1]);
 	}
-#define exit_err(...) \
-	if (fds[0] != -1) { \
-		char msg[1024]; \
-		snprintf(msg, sizeof(msg), __VA_ARGS__); \
-		/* fool compiler */ \
-		if (write(fds[1], msg, strlen(msg) + 1) > -2) \
-			exit(1); /* not that retcode matters */ \
-	} else { \
-		logerr(__VA_ARGS__); \
-		exit(1); \
-	}
-#define exit_ok \
-	if (fds[0] != -1) { \
-		/* we're fine, flag our grandparent (= the original
-		 * process being called) it can terminate */ \
-		if (write(fds[1], "OK", 3) < -2) \
-			exit(1);  /* if our grantparent died, we better do too */ \
-	} \
-	close(fds[0]); \
-	close(fds[1]); \
-	fds[0] = fds[1] = -1; \
-	startup_success = 1;
 
 	if (pidfile_handle) {
 		fprintf(pidfile_handle, "%d\n", getpid());
@@ -698,46 +671,54 @@ main(int argc, char * const argv[])
 
 	logout("starting carbon-c-relay v%s (%s), pid=%d\n",
 			VERSION, GIT_VERSION, getpid());
-	if (relay_stdout != NULL) {
-		fprintf(relay_stdout, "configuration:\n");
-		fprintf(relay_stdout, "    relay hostname = %s\n", relay_hostname);
-		fprintf(relay_stdout, "    workers = %d\n", workercnt);
-		fprintf(relay_stdout, "    send batch size = %d\n", batchsize);
-		fprintf(relay_stdout, "    server queue size = %d\n", queuesize);
-		fprintf(relay_stdout, "    server max stalls = %d\n", maxstalls);
-		fprintf(relay_stdout, "    listen backlog = %u\n", listenbacklog);
-		if (sockbufsize > 0)
-			fprintf(relay_stdout, "    socket bufsize = %u\n", sockbufsize);
-		fprintf(relay_stdout, "    server connection IO timeout = %dms\n",
-				iotimeout);
-		if (allowed_chars != NULL)
-			fprintf(relay_stdout, "    extra allowed characters = %s\n",
-					allowed_chars);
-		if (mode & MODE_DEBUG)
-			fprintf(relay_stdout, "    debug = true\n");
+	fprintf(relay_stdout, "configuration:\n");
+	fprintf(relay_stdout, "    relay hostname = %s\n", relay_hostname);
+	fprintf(relay_stdout, "    listen port = %u\n", listenport);
+	if (listeninterface != NULL)
+		fprintf(relay_stdout, "    listen interface = %s\n", listeninterface);
+	fprintf(relay_stdout, "    workers = %d\n", workercnt);
+	fprintf(relay_stdout, "    send batch size = %d\n", batchsize);
+	fprintf(relay_stdout, "    server queue size = %d\n", queuesize);
+	fprintf(relay_stdout, "    server max stalls = %d\n", maxstalls);
+	fprintf(relay_stdout, "    listen backlog = %u\n", listenbacklog);
+	if (sockbufsize > 0)
+		fprintf(relay_stdout, "    socket bufsize = %u\n", sockbufsize);
+	fprintf(relay_stdout, "    server connection IO timeout = %dms\n",
+			iotimeout);
+	if (allowed_chars != NULL)
+		fprintf(relay_stdout, "    extra allowed characters = %s\n",
+				allowed_chars);
+	if (mode & MODE_DEBUG)
+		fprintf(relay_stdout, "    debug = true\n");
 #ifdef ENABLE_TRACE
-		if (mode & MODE_TRACE)
-			fprintf(relay_stdout, "    trace = true\n");
+	if (mode & MODE_TRACE)
+		fprintf(relay_stdout, "    trace = true\n");
 #endif
-		else if (mode & MODE_SUBMISSION)
-			fprintf(relay_stdout, "    submission = true\n");
-		else if (mode & MODE_DAEMON)
-			fprintf(relay_stdout, "    daemon = true\n");
-		fprintf(relay_stdout, "    configuration = %s\n", config);
-		fprintf(relay_stdout, "\n");
-	}
+	else if (mode & MODE_SUBMISSION)
+		fprintf(relay_stdout, "    submission = true\n");
+	else if (mode & MODE_DAEMON)
+		fprintf(relay_stdout, "    daemon = true\n");
+	fprintf(relay_stdout, "    configuration = %s\n", config);
+	fprintf(relay_stdout, "\n");
 
-	if ((rtr = router_readconfig(NULL, config, workercnt,
+	/* hack to set defaults from command line flags */
+	if ((rtr = router_readconfig(NULL, "/dev/null",
 					queuesize, batchsize, maxstalls,
-					iotimeout, sockbufsize, listenport)) == NULL)
+					iotimeout, sockbufsize)) == NULL)
 	{
-		exit_err("failed to read configuration '%s'\n", config);
+		logerr("failed to create router configuration\n");
+		return 1;
+	}
+	router_set_collectorvals(rtr, collector_interval, NULL, smode);
+
+	if ((rtr = router_readconfig(rtr, config,
+					queuesize, batchsize, maxstalls,
+					iotimeout, sockbufsize)) == NULL)
+	{
+		logerr("failed to read configuration '%s'\n", config);
+		return 1;
 	}
 	router_optimise(rtr, optimiserthreshold);
-
-	/* we're done if all we wanted was to test the config */
-	if (mode & MODE_CONFIGTEST)
-		exit(0);
 
 	aggrs = router_getaggregators(rtr);
 	numaggregators = aggregator_numaggregators(aggrs);
@@ -763,11 +744,6 @@ main(int argc, char * const argv[])
 		while (fgets(metricbuf, sizeof(metricbuf), stdin) != NULL) {
 			if ((p = strchr(metricbuf, '\n')) != NULL)
 				*p = '\0';
-			p = metricbuf;
-			while (isspace(*p))
-				p++;
-			if (*p == '\0')
-				continue;
 			router_test(rtr, metricbuf);
 		}
 
@@ -775,53 +751,67 @@ main(int argc, char * const argv[])
 	}
 
 	if (signal(SIGINT, sig_handler) == SIG_ERR) {
-		exit_err("failed to create SIGINT handler: %s\n", strerror(errno));
+		logerr("failed to create SIGINT handler: %s\n", strerror(errno));
+		return 1;
 	}
 	if (signal(SIGTERM, sig_handler) == SIG_ERR) {
-		exit_err("failed to create SIGTERM handler: %s\n", strerror(errno));
+		logerr("failed to create SIGTERM handler: %s\n", strerror(errno));
+		return 1;
 	}
 	if (signal(SIGQUIT, sig_handler) == SIG_ERR) {
-		exit_err("failed to create SIGQUIT handler: %s\n", strerror(errno));
+		logerr("failed to create SIGQUIT handler: %s\n", strerror(errno));
+		return 1;
 	}
 	if (signal(SIGHUP, sig_handler) == SIG_ERR) {
-		exit_err("failed to create SIGHUP handler: %s\n", strerror(errno));
+		logerr("failed to create SIGHUP handler: %s\n", strerror(errno));
+		return 1;
 	}
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
-		exit_err("failed to ignore SIGPIPE: %s\n", strerror(errno));
+		logerr("failed to ignore SIGPIPE: %s\n", strerror(errno));
+		return 1;
 	}
 
-	workers = malloc(sizeof(dispatcher *) *
-			(1/*lsnr*/ + workercnt + 1/*sentinel*/));
+	workers = malloc(sizeof(dispatcher *) * (1 + workercnt + 1));
 	if (workers == NULL) {
-		exit_err("failed to allocate memory for workers\n");
+		logerr("failed to allocate memory for workers\n");
+		return 1;
 	}
 
+	if (bindlisten(stream_sock, &stream_socklen,
+				dgram_sock, &dgram_socklen,
+				listeninterface, listenport, listenbacklog) < 0) {
+		logerr("failed to bind on port %s:%d: %s\n",
+				listeninterface == NULL ? "" : listeninterface,
+				listenport, strerror(errno));
+		return -1;
+	}
 	dispatch_set_bufsize(sockbufsize);
-
-	lsnrs = router_get_listeners(rtr);
-	for ( ; lsnrs != NULL; lsnrs = lsnrs->next) {
-		if (bindlisten(lsnrs, listenbacklog) != 0) {
-			exit_err("failed to setup listener\n");
-		}
-		if (dispatch_addlistener(lsnrs) != 0) {
-			exit_err("failed to add listener\n");
+	for (ch = 0; ch < stream_socklen; ch++) {
+		if (dispatch_addlistener(stream_sock[ch]) != 0) {
+			logerr("failed to add listener\n");
+			return -1;
 		}
 	}
-	/* ensure the listener id is at the end for regex_t array hack */
-	if ((workers[0] = dispatch_new_listener(workercnt)) == NULL)
-		logerr("failed to add listener dispatcher\n");
+	for (ch = 0; ch < dgram_socklen; ch++) {
+		if (dispatch_addlistener_udp(dgram_sock[ch]) != 0) {
+			logerr("failed to listen to datagram socket\n");
+			return -1;
+		}
+	}
+	if ((workers[0] = dispatch_new_listener()) == NULL)
+		logerr("failed to add listener\n");
 
 	if (allowed_chars == NULL)
 		allowed_chars = "-_:#";
 	logout("starting %d workers\n", workercnt);
-	for (id = 0; id < workercnt; id++) {
-		workers[id + 1] = dispatch_new_connection(id, rtr, allowed_chars);
-		if (workers[id + 1] == NULL) {
+	for (id = 1; id < 1 + workercnt; id++) {
+		workers[id + 0] = dispatch_new_connection(rtr, allowed_chars);
+		if (workers[id + 0] == NULL) {
 			logerr("failed to add worker %d\n", id);
 			break;
 		}
 	}
-	workers[id + 0] = NULL;  /* sentinel */
+	workers[id + 0] = NULL;
 	if (id < 1 + workercnt) {
 		logerr("shutting down due to errors\n");
 		keep_running = 0;
@@ -861,10 +851,8 @@ main(int argc, char * const argv[])
 		keep_running = 0;
 	}
 
-	if (keep_running != 0) {
+	if (keep_running == 0)
 		logout("startup sequence complete\n");
-		exit_ok;
-	}
 
 	/* workers do the work, just wait */
 	while (keep_running) {
@@ -877,10 +865,10 @@ main(int argc, char * const argv[])
 
 	logout("shutting down...\n");
 	/* make sure we don't accept anything new anymore */
-	lsnrs = router_get_listeners(rtr);
-	for ( ; lsnrs != NULL; lsnrs = lsnrs->next) {
-		shutdownclose(lsnrs);
-	}
+	for (ch = 0; ch < stream_socklen; ch++)
+		dispatch_removelistener(stream_sock[ch]);
+	destroy_usock(listenport);
+	logout("closed listeners for port %u\n", listenport);
 	/* since workers will be freed, stop querying the structures */
 	collector_stop();
 	server_shutdown(internal_submission);
@@ -916,12 +904,5 @@ main(int argc, char * const argv[])
 
 	logout("stopped carbon-c-relay v%s (%s)\n", VERSION, GIT_VERSION);
 
-	/* if we never called exit_ok before, it means we shut down due to
-	 * errors, so exit with an error */
-	if (startup_success == 0) {
-		/* this message will never reach the log/screen when not
-		 * daemonised, because the logger already shut down */
-		exit_err("startup failed, review the logs for details\n");
-	}
 	return 0;
 }

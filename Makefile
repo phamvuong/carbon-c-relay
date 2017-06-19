@@ -52,8 +52,10 @@ $(BINDIR)/$(TARGET): $(OBJECTS)
 	@echo "Linking complete. Binary file created!"
 
 $(OBJECTS):
-	cd $(SRCDIR) \
-	$(RECONF); $(CONF)
+	if [ -a $(SRCDIR)/Makefile.am ] ; then \
+		cd $(SRCDIR); \
+		$(RECONF); $(CONF); \
+	fi
 	$(MAKE) -C $(SRCDIR)
 	mv $(SRCDIR)/*.o $(OBJDIR)
 	@echo "Compiled "$<" successfully!"
@@ -74,8 +76,13 @@ uninstall:
 	$(RM) $(PREFIX)/$(BINDIR)/$(TARGET)
 	$(RM) -rf $(DESTDIR)/etc/$(TARGET) 
 
+TMPFILES := *.o config.log .deps config.h config.status stamp-h1
+VERSION=$(shell sed -n '/VERSION/s/^.*"\([0-9.]\+\)".*$$/\1/p' $(SRCDIR)/relay.h)
+ifeq ($(VERSION), )
+	TMPFILE += Makefile
+	VERSION = $(shell sed -n "s/^PACKAGE_VERSION='\(.*\)'/\1/p" $(SRCDIR)/$(CONF))
+endif
 
-VERSION = $(shell sed -n "s/^PACKAGE_VERSION='\(.*\)'/\1/p" $(SRCDIR)/$(CONF))
 .PHONY: dist
 dist:
 	$(GIT) archive \
@@ -99,7 +106,7 @@ clean:
 distclean: clean
 	@$(RM) -r $(BINDIR)
 	@$(RM) -r $(OBJDIR)
-	cd $(SRCDIR); $(RM) -r *.o config.log Makefile .deps config.h config.status stamp-h1
-	@$(RM) -r rpm/SOURCES rpm/BUILD rpm/BUILDROOT rpm/RPMS rpm/SRPMS
+	@$(RM) -r $(addprefix $(SRCDIR)/, $(TMPFILES))
+	@$(RM) -r $(addprefix rpm/, SOURCES BUILD BUILDROOT RPMS SRPMS)
 	@$(RM) $(TARGET).*$(VERSION).*
 	@echo "Executable removed!"

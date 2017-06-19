@@ -3,8 +3,6 @@
 #include "conffile.h"
 #include "conffile.tab.h"
 #include "aggregator.h"
-#include "receptor.h"
-#include "config.h"
 
 int router_yylex(ROUTER_YYSTYPE *, ROUTER_YYLTYPE *, void *, router *, allocator *, allocator *);
 %}
@@ -33,18 +31,6 @@ struct _agcomp {
 	char *metric;
 	struct _agcomp *next;
 };
-struct _lsnr {
-	rcptr_lsnrtype type;
-	rcptr_transport transport;
-	struct _rcptr *rcptr;
-};
-struct _rcptr {
-	serv_ctype ctype;
-	char *ip;
-	int port;
-	void *saddr;
-	struct _rcptr *next;
-};
 }
 
 %define api.prefix {router_yy}
@@ -67,14 +53,13 @@ struct _rcptr {
 	cluster_path cluster_paths cluster_opt_path
 
 %token crMATCH
-%token crVALIDATE crELSE crLOG crDROP crROUTE crUSING
-%token crSEND crTO crBLACKHOLE crSTOP
+%token crVALIDATE crELSE crLOG crDROP crSEND crTO crBLACKHOLE crSTOP
 %type <destinations *> match_dst match_opt_dst match_dsts
 	match_dsts2 match_opt_send_to match_send_to aggregate_opt_send_to
 %type <int> match_opt_stop match_log_or_drop
-%type <char *> match_opt_route
 %type <struct _maexpr *> match_opt_validate match_expr match_opt_expr
-	match_exprs match_exprs2
+	match_exprs match_exprs_subst match_exprs2 match_subst_expr
+	match_subst_opt_expr 
 
 %token crREWRITE
 %token crINTO
@@ -96,13 +81,6 @@ struct _rcptr {
 %type <int> statistics_opt_interval
 %type <col_mode> statistics_opt_counters
 %type <char *> statistics_opt_prefix
-
-%token crLISTEN
-%token crLINEMODE crGZIP crBZIP2 crLZMA crSSL crUNIX
-%type <serv_ctype> rcptr_proto
-%type <struct _rcptr *> receptor opt_receptor receptors
-%type <rcptr_transport> transport_mode
-%type <struct _lsnr *> listener
 
 %token crINCLUDE
 
@@ -127,7 +105,6 @@ command: cluster
 	   | aggregate
 	   | send
 	   | statistics
-	   | listen
 	   | include
 	   ;
 
@@ -136,11 +113,6 @@ cluster: crCLUSTER crSTRING[name] cluster_type[type] cluster_hosts[servers]
 	   {
 	   	struct _clhost *w;
 		char *err;
-		int srvcnt;
-
-		/* count number of servers for ch_new */
-		for (srvcnt = 0, w = $servers; w != NULL; w = w->next, srvcnt++)
-			;
 
 		if (($$ = ra_malloc(ralloc, sizeof(cluster))) == NULL) {
 			logerr("malloc failed for cluster '%s'\n", $name);
@@ -164,12 +136,10 @@ cluster: crCLUSTER crSTRING[name] cluster_type[type] cluster_hosts[servers]
 					YYERROR;
 				}
 				$$->members.ch->repl_factor = (unsigned char)$type.ival;
-				$$->members.ch->ring = ch_new(ralloc,
+				$$->members.ch->ring = ch_new(
 					$$->type == CARBON_CH ? CARBON :
 					$$->type == FNV1A_CH ? FNV1a :
-					JUMP_FNV1a, srvcnt);
-				$$->members.ch->servers = NULL;
-				$type.ival = 0;  /* hack, avoid triggering use_all */
+					JUMP_FNV1a);
 				break;
 			case FORWARD:
 				$$->members.forward = NULL;
@@ -281,7 +251,7 @@ cluster_path: crSTRING[path]
 					YYERROR;
 				}
 				ret->ip = $path;
-				ret->port = GRAPHITE_PORT;
+				ret->port = 2003;
 				ret->saddr = NULL;
 				ret->hint = NULL;
 				ret->inst = NULL;
@@ -316,15 +286,6 @@ cluster_host: crSTRING[ip] cluster_opt_instance[inst] cluster_opt_proto[prot]
 			;
 cluster_opt_instance:                    { $$ = NULL; }
 					| '=' crSTRING[inst] { $$ = $inst; }
-					| '=' crINTVAL[inst]
-					{
-						$$ = ra_malloc(palloc, sizeof(char) * 12);
-						if ($$ == NULL) {
-							logerr("out of memory\n");
-							YYABORT;
-						}
-						snprintf($$, 12, "%d", $inst);
-					}
 					;
 cluster_opt_proto:               { $$ = CON_TCP; }
 				 | crPROTO crUDP { $$ = CON_UDP; }
@@ -334,7 +295,7 @@ cluster_opt_proto:               { $$ = CON_TCP; }
 
 /*** {{{ BEGIN match ***/
 match: crMATCH match_exprs[exprs] match_opt_validate[val]
-	 match_opt_route[masq] match_opt_send_to[dsts] match_opt_stop[stop]
+	 match_opt_send_to[dsts] match_opt_stop[stop]
 	 {
 	 	/* each expr comes with an allocated route, populate it */
 		struct _maexpr *we;
@@ -369,13 +330,9 @@ match: crMATCH match_exprs[exprs] match_opt_validate[val]
 		} else {
 			d = $dsts;
 		}
-		/* replace with copy on the router allocator */
-		if ($masq != NULL)
-			$masq = ra_strdup(ralloc, $masq);
 		for (we = $exprs; we != NULL; we = we->next) {
 			we->r->next = NULL;
 			we->r->dests = d;
-			we->r->masq = $masq;
 			we->r->stop = $dsts == NULL ? 0 :
 					$dsts->cl->type == BLACKHOLE ? 1 : $stop;
 			err = router_add_route(rtr, we->r);
@@ -395,7 +352,7 @@ match_exprs: '*'
 				YYABORT;
 			}
 		   	$$->r = NULL;
-			if (router_validate_expression(rtr, &($$->r), "*") != NULL)
+			if (router_validate_expression(rtr, &($$->r), "*", 0) != NULL)
 				YYABORT;
 			$$->drop = 0;
 			$$->next = NULL;
@@ -417,7 +374,33 @@ match_expr: crSTRING[expr]
 				YYABORT;
 			}
 		   	$$->r = NULL;
-		  	err = router_validate_expression(rtr, &($$->r), $expr);
+		  	err = router_validate_expression(rtr, &($$->r), $expr, 0);
+			if (err != NULL) {
+				router_yyerror(&yylloc, yyscanner, rtr,
+						ralloc, palloc, err);
+				YYERROR;
+			}
+			$$->drop = 0;
+			$$->next = NULL;
+		  }
+		  ;
+
+match_exprs_subst: match_subst_expr[l] match_subst_opt_expr[r]
+				 { $l->next = $r; $$ = $l; }
+
+match_subst_opt_expr:                   { $$ = NULL; }
+					| match_exprs_subst { $$ = $1; }
+					;
+
+match_subst_expr: crSTRING[expr]
+		  {
+			char *err;
+			if (($$ = ra_malloc(palloc, sizeof(struct _maexpr))) == NULL) {
+				logerr("out of memory\n");
+				YYABORT;
+			}
+		   	$$->r = NULL;
+		  	err = router_validate_expression(rtr, &($$->r), $expr, 1);
 			if (err != NULL) {
 				router_yyerror(&yylloc, yyscanner, rtr,
 						ralloc, palloc, err);
@@ -437,7 +420,7 @@ match_opt_validate: { $$ = NULL; }
 						YYABORT;
 					}
 					$$->r = NULL;
-					err = router_validate_expression(rtr, &($$->r), $expr);
+					err = router_validate_expression(rtr, &($$->r), $expr, 0);
 					if (err != NULL) {
 						router_yyerror(&yylloc, yyscanner, rtr,
 								ralloc, palloc, err);
@@ -451,10 +434,6 @@ match_opt_validate: { $$ = NULL; }
 match_log_or_drop: crLOG  { $$ = 0; }
 				 | crDROP { $$ = 1; }
 				 ;
-
-match_opt_route: { $$ = NULL; }
-			   | crROUTE crUSING crSTRING[expr] { $$ = $expr; }
-			   ;
 
 match_opt_send_to: { $$ = NULL; }
 				 | match_send_to { $$ = $1; }
@@ -510,7 +489,7 @@ rewrite: crREWRITE crSTRING[expr] crINTO crSTRING[replacement]
 		route *r = NULL;
 		cluster *cl;
 
-		err = router_validate_expression(rtr, &r, $expr);
+		err = router_validate_expression(rtr, &r, $expr, 1);
 		if (err != NULL) {
 			router_yyerror(&yylloc, yyscanner, rtr, ralloc, palloc, err);
 			YYERROR;
@@ -549,7 +528,7 @@ rewrite: crREWRITE crSTRING[expr] crINTO crSTRING[replacement]
 /*** }}} END rewrite ***/
 
 /*** {{{ BEGIN aggregate ***/
-aggregate: crAGGREGATE match_exprs2[exprs] crEVERY crINTVAL[intv] crSECONDS
+aggregate: crAGGREGATE match_exprs_subst[exprs] crEVERY crINTVAL[intv] crSECONDS
 		 crEXPIRE crAFTER crINTVAL[expire] crSECONDS
 		 aggregate_opt_timestamp[tswhen]
 		 aggregate_computes[computes]
@@ -739,7 +718,7 @@ statistics: crSTATISTICS
 		  }
 		  ;
 
-statistics_opt_interval: { $$ = -1; }
+statistics_opt_interval: { $$ = 0; }
 					   | crSUBMIT crEVERY crINTVAL[intv] crSECONDS
 					   {
 					   	if ($intv <= 0) {
@@ -760,164 +739,10 @@ statistics_opt_prefix:                                  { $$ = NULL; }
 					 ;
 /*** }}} END statistics ***/
 
-/*** {{{ BEGIN listen ***/
-listen: crLISTEN listener[lsnr]
-	  {
-	  	struct _rcptr *walk;
-		char *err;
-
-		for (walk = $lsnr->rcptr; walk != NULL; walk = walk->next) {
-			err = router_add_listener(rtr, $lsnr->type, $lsnr->transport,
-				walk->ctype, walk->ip, walk->port, walk->saddr);
-			if (err != NULL) {
-				router_yyerror(&yylloc, yyscanner, rtr,
-						ralloc, palloc, err);
-				YYERROR;
-			}
-		}
-	  }
-	  ;
-
-listener: crLINEMODE transport_mode[mode] receptors[ifaces]
-		{
-			if (($$ = ra_malloc(palloc, sizeof(struct _lsnr))) == NULL) {
-				logerr("malloc failed\n");
-				YYABORT;
-			}
-			$$->type = LSNR_LINE;
-			$$->transport = $mode;
-			$$->rcptr = $ifaces;
-			if ($mode != W_PLAIN) {
-				struct _rcptr *walk;
-
-				for (walk = $ifaces; walk != NULL; walk = walk->next) {
-					if (walk->ctype == CON_UDP) {
-						router_yyerror(&yylloc, yyscanner, rtr, ralloc, palloc,
-							"cannot use UDP transport for "
-							"compressed/encrypted stream");
-						YYERROR;
-					}
-				}
-			}
-		}
-		;
-
-transport_mode:         { $$ = W_PLAIN; }
-			  | crGZIP  {
-#ifdef HAVE_GZIP
-							$$ = W_GZIP;
-#else
-							router_yyerror(&yylloc, yyscanner, rtr,
-								ralloc, palloc,
-								"feature gzip not compiled in");
-							YYERROR;
-#endif
-						}
-			  | crBZIP2 {
-#ifdef HAVE_BZIP2
-							$$ = W_BZIP2;
-#else
-							router_yyerror(&yylloc, yyscanner, rtr,
-								ralloc, palloc,
-								"feature bzip2 not compiled in");
-							YYERROR;
-#endif
-						}
-			  | crLZMA  {
-#ifdef HAVE_LZMA
-							$$ = W_LZMA;
-#else
-							router_yyerror(&yylloc, yyscanner, rtr,
-								ralloc, palloc,
-								"feature lzma not compiled in");
-							YYERROR;
-#endif
-						}
-			  | crSSL   {
-#ifdef HAVE_SSL
-							$$ = W_SSL;
-#else
-							router_yyerror(&yylloc, yyscanner, rtr,
-								ralloc, palloc,
-								"feature ssl not compiled in");
-							YYERROR;
-#endif
-						}
-			  ;
-
-receptors: receptor[l] opt_receptor[r] { $l->next = $r; $$ = $l; }
-		 ;
-
-opt_receptor:           { $$ = NULL; }
-			| receptors { $$ = $1;   }
-			;
-
-receptor: crSTRING[ip] crPROTO rcptr_proto[prot]
-		{
-			char *err;
-			void *hint = NULL;
-			char *w;
-			char bcip[24];
-
-			if (($$ = ra_malloc(palloc, sizeof(struct _rcptr))) == NULL) {
-				logerr("malloc failed\n");
-				YYABORT;
-			}
-			$$->ctype = $prot;
-
-			/* find out if this is just a port */
-			for (w = $ip; *w != '\0'; w++)
-				if (*w < '0' || *w > '9')
-					break;
-			if (*w == '\0') {
-				snprintf(bcip, sizeof(bcip), ":%s", $ip);
-				$ip = bcip;
-			}
-
-			err = router_validate_address(
-					rtr,
-					&($$->ip), &($$->port), &($$->saddr), &hint,
-					$ip, $prot);
-			if (err != NULL) {
-				router_yyerror(&yylloc, yyscanner, rtr,
-						ralloc, palloc, err);
-				YYERROR;
-			}
-			free(hint);
-			$$->next = NULL;
-		}
-		| crSTRING[path] crPROTO crUNIX
-		{
-			char *err;
-
-			if (($$ = ra_malloc(palloc, sizeof(struct _rcptr))) == NULL) {
-				logerr("malloc failed\n");
-				YYABORT;
-			}
-			$$->ctype = CON_UNIX;
-			$$->ip = $path;
-			$$->port = 0;
-			$$->saddr = NULL;
-			err = router_validate_path(rtr, $path);
-			if (err != NULL) {
-				router_yyerror(&yylloc, yyscanner, rtr,
-						ralloc, palloc, err);
-				YYERROR;
-			}
-			$$->next = NULL;
-		}
-		;
-
-rcptr_proto: crTCP { $$ = CON_TCP; }
-		   | crUDP { $$ = CON_UDP; }
-		   ;
-/*** }}} END listen ***/
-
 /*** {{{ BEGIN include ***/
 include: crINCLUDE crSTRING[path]
 	   {
-	   	if (router_readconfig(rtr, $path, 0, 0, 0, 0, 0, 0, 0) == NULL)
-			YYERROR;
+	   	router_readconfig(rtr, $path, 0, 0, 0, 0, 0);
 	   }
 	   ;
 /*** }}} END include ***/

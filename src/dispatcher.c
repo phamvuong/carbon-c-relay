@@ -79,7 +79,7 @@ struct _dispatcher {
 	char *allowed_chars;
 };
 
-static listener **listeners = NULL;
+static connection **listeners = NULL;
 static connection *connections = NULL;
 static size_t connectionslen = 0;
 pthread_rwlock_t listenerslock = PTHREAD_RWLOCK_INITIALIZER;
@@ -119,34 +119,14 @@ dispatch_check_rlimit_and_warn(void)
  * Listener sockets are those which need to be accept()-ed on.
  */
 int
-dispatch_addlistener(listener *lsnr)
+dispatch_addlistener(int sock)
 {
+	connection *newconn;
 	int c;
-	int *socks;
-
-	if (lsnr->ctype == CON_UDP) {
-		/* Adds a pseudo-listener for datagram (UDP) sockets, which is
-		 * pseudo, for in fact it adds a new connection, but makes sure
-		 * that connection won't be closed after being idle, and won't
-		 * count that connection as an incoming connection either. */
-		for (socks = lsnr->socks; *socks != -1; socks++) {
-			c = dispatch_addconnection(*socks);
-
-			if (c == -1)
-				return 1;
-
-			connections[c].noexpire = 1;
-			connections[c].isudp = 1;
-			acceptedconnections--;
-		}
-
-		return 0;
-	}
 
 	pthread_rwlock_wrlock(&listenerslock);
 	if (listeners == NULL) {
-		/* once all-or-nothing allocation */
-		if ((listeners = malloc(sizeof(listener *) * MAX_LISTENERS)) == NULL)
+		if ((listeners = malloc(sizeof(connection *) * MAX_LISTENERS)) == NULL)
 		{
 			pthread_rwlock_unlock(&listenerslock);
 			return 1;
@@ -156,9 +136,17 @@ dispatch_addlistener(listener *lsnr)
 	}
 	for (c = 0; c < MAX_LISTENERS; c++) {
 		if (listeners[c] == NULL) {
-			listeners[c] = lsnr;
-			for (socks = lsnr->socks; *socks != -1; socks++)
-				(void) fcntl(*socks, F_SETFL, O_NONBLOCK);
+			newconn = malloc(sizeof(connection));
+			if (newconn == NULL) {
+				pthread_rwlock_unlock(&listenerslock);
+				return 1;
+			}
+			(void) fcntl(sock, F_SETFL, O_NONBLOCK);
+			newconn->sock = sock;
+			newconn->takenby = 0;
+			newconn->buflen = 0;
+
+			listeners[c] = newconn;
 			break;
 		}
 	}
@@ -179,15 +167,15 @@ dispatch_addlistener(listener *lsnr)
  * global lock.  Frequent usage of this function is not anticipated.
  */
 void
-dispatch_removelistener(listener *lsnr)
+dispatch_removelistener(int sock)
 {
 	int c;
-	int *socks;
+	connection *conn;
 
 	pthread_rwlock_wrlock(&listenerslock);
 	/* find connection */
 	for (c = 0; c < MAX_LISTENERS; c++)
-		if (listeners[c] != NULL && listeners[c] == lsnr)
+		if (listeners[c] != NULL && listeners[c]->sock == sock)
 			break;
 	if (c == MAX_LISTENERS) {
 		/* not found?!? */
@@ -196,8 +184,9 @@ dispatch_removelistener(listener *lsnr)
 		return;
 	}
 	/* cleanup */
-	for (socks = lsnr->socks; *socks != -1; socks++)
-		close(*socks);
+	conn = listeners[c];
+	close(conn->sock);
+	free(conn);
 	listeners[c] = NULL;
 	pthread_rwlock_unlock(&listenerslock);
 }
@@ -313,6 +302,28 @@ dispatch_addconnection_aggr(int sock)
 
 	return 0;
 }
+
+/**
+ * Adds a pseudo-listener for datagram (UDP) sockets, which is pseudo,
+ * for in fact it adds a new connection, but makes sure that connection
+ * won't be closed after being idle, and won't count that connection as
+ * an incoming connection either.
+ */
+int
+dispatch_addlistener_udp(int sock)
+{
+	int conn = dispatch_addconnection(sock);
+
+	if (conn == -1)
+		return 1;
+
+	connections[conn].noexpire = 1;
+	connections[conn].isudp = 1;
+	acceptedconnections--;
+
+	return 0;
+}
+
 
 inline static char
 dispatch_process_dests(connection *conn, dispatcher *self, struct timeval now)
@@ -436,9 +447,9 @@ dispatch_connection(connection *conn, dispatcher *self, struct timeval start)
 						self->id, conn->sock, conn->metric);
 				__sync_add_and_fetch(&(self->blackholes),
 						router_route(self->rtr,
-							conn->dests, &conn->destlen, CONN_DESTS_SIZE,
-							conn->srcaddr,
-							conn->metric, firstspace, self->id));
+						conn->dests, &conn->destlen, CONN_DESTS_SIZE,
+						conn->srcaddr,
+						conn->metric, firstspace));
 				tracef("dispatcher %d, connfd %d, destinations %zd\n",
 						self->id, conn->sock, conn->destlen);
 
@@ -559,18 +570,15 @@ dispatch_runner(void *arg)
 	if (self->type == LISTENER) {
 		struct pollfd ufds[MAX_LISTENERS];
 		int fds;
-		int *sock;
 		while (__sync_bool_compare_and_swap(&(self->keep_running), 1, 1)) {
 			pthread_rwlock_rdlock(&listenerslock);
 			fds = 0;
 			for (c = 0; c < MAX_LISTENERS; c++) {
 				if (listeners[c] == NULL)
 					continue;
-				for (sock = listeners[c]->socks; *sock != -1; sock++) {
-					ufds[fds].fd = *sock;
-					ufds[fds].events = POLLIN;
-					fds++;
-				}
+				ufds[fds].fd = listeners[c]->sock;
+				ufds[fds].events = POLLIN;
+				fds++;
 			}
 			pthread_rwlock_unlock(&listenerslock);
 			if (poll(ufds, fds, 1000) > 0) {
@@ -657,10 +665,6 @@ dispatch_new(char id, enum conntype type, router *r, char *allowed_chars)
 
 	if (ret == NULL)
 		return NULL;
-	if (type == CONNECTION && r == NULL) {
-		free(ret);
-		return NULL;
-	}
 
 	ret->id = id;
 	ret->type = type;
@@ -693,13 +697,16 @@ dispatch_set_bufsize(unsigned int nsockbufsize)
 	sockbufsize = nsockbufsize;
 }
 
+static char globalid = 0;
+
 /**
  * Starts a new dispatcher specialised in handling incoming connections
  * (and putting them on the queue for handling the connections).
  */
 dispatcher *
-dispatch_new_listener(char id)
+dispatch_new_listener(void)
 {
+	char id = globalid++;
 	return dispatch_new(id, LISTENER, NULL, NULL);
 }
 
@@ -708,8 +715,9 @@ dispatch_new_listener(char id)
  * existing connections.
  */
 dispatcher *
-dispatch_new_connection(char id, router *r, char *allowed_chars)
+dispatch_new_connection(router *r, char *allowed_chars)
 {
+	char id = globalid++;
 	return dispatch_new(id, CONNECTION, r, allowed_chars);
 }
 

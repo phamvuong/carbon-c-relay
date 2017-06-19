@@ -25,13 +25,14 @@
 typedef struct _dispatcher dispatcher;
 
 void dispatch_check_rlimit_and_warn(void);
-int dispatch_addlistener(listener *lsnr);
-void dispatch_removelistener(listener *lsnr);
+int dispatch_addlistener(int sock);
+int dispatch_addlistener_udp(int sock);
+void dispatch_removelistener(int sock);
 int dispatch_addconnection(int sock);
 int dispatch_addconnection_aggr(int sock);
 void dispatch_set_bufsize(unsigned int sockbufsize);
-dispatcher *dispatch_new_listener(char id);
-dispatcher *dispatch_new_connection(char id, router *r, char *allowed_chars);
+dispatcher *dispatch_new_listener(void);
+dispatcher *dispatch_new_connection(router *r, char *allowed_chars);
 void dispatch_stop(dispatcher *d);
 void dispatch_shutdown(dispatcher *d);
 void dispatch_free(dispatcher *d);

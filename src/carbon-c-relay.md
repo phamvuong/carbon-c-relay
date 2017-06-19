@@ -51,6 +51,12 @@ These options control the behaviour of **carbon-c-relay**.
     (test mode) this also prints stub routes and consistent-hash ring
     contents.
 
+  * `-m`: (deprecated)
+    Change statistics submission to be like carbon-cache.py, e.g. not
+    cumulative.  After each submission, all counters are reset to `0`.
+    You should set this mode via the configuration file instead using
+    `statistics reset counters after interval`.
+
   * `-s`:
     Enable submission mode.  In this mode, internal statistics are not
     generated.  Instead, queue pressure and metrics drops are reported on
@@ -66,10 +72,7 @@ These options control the behaviour of **carbon-c-relay**.
     configuration.  This mode is very useful for testing relay routes for
     regular expression syntax etc.  It also allows to give insight on how
     routing is applied in complex configurations, for it shows rewrites and
-    aggregates taking place as well.  When `-t` is repeated, the relay
-    will only test the configuration for validity and exit immediately
-    afterwards.  Any standard output is suppressed in this mode, making
-    it ideal for start-scripts to test a (new) configuration.
+    aggregates taking place as well.
 
   * `-D`:
     Deamonise into the background after startup.  This option requires
@@ -79,6 +82,12 @@ These options control the behaviour of **carbon-c-relay**.
     Read configuration from *config-file*.  A configuration consists of
     clusters and routes.  See [CONFIGURATION SYNTAX](#configuration-syntax)
     for more information on the options and syntax of this file.
+
+  * `-i` *iface*:
+    Open up connections on interface *iface*.  Currently only one
+    interface can be specified, and it is specified by its IP address, not
+    the interface name.  By default, the relay opens listeners on all
+    available interfaces (a.k.a. `0.0.0.0`).
 
   * `-l` *log-file*:
     Use *log-file* for writing messages.  Without this option, the relay
@@ -90,9 +99,7 @@ These options control the behaviour of **carbon-c-relay**.
     Listen for connections on port *port*.  The port number is used for
     both `TCP`, `UDP` and `UNIX sockets`.  In the latter case, the socket
     file contains the port number.  The port defaults to *2003*, which is
-    also used by the original `carbon-cache.py`.  Note that this only
-    applies to the defaults, when `listen` directives are in the config,
-    this setting is ignored.
+    also used by the original `carbon-cache.py`.
 
   * `-w` *workers*:
     Use *workers* number of threads.  The default number of workers is
@@ -131,20 +138,24 @@ These options control the behaviour of **carbon-c-relay**.
     occasional disruption scenario and max effort to not loose metrics
     with moderate slowing down of clients.
 
+  * `-S` *interval*: (deprecated)
+    Set the interval in which statistics are being generated and sent by
+    the relay to *interval* seconds.  The default is *60*.  You should
+    set this value through the config file instead using `statistics
+    submit every <interval> seconds`.
+
   * `-B` *backlog*:
     Sets TCP connection listen backlog to *backlog* connections.  The
-    default value is *32* but on servers which receive many concurrent
+    default value is *3* but on servers which receive many concurrent
     connections, this setting likely needs to be increased to avoid
     connection refused errors on the clients.
 
   * `-U` *bufsize*:
-    Sets the socket send/receive buffer sizes in bytes, for both TCP and UDP
-    scenarios.  When unset, the OS default is used.  The maximum is also
-    determined by the OS.  The sizes are set using setsockopt with the flags
-    SO_RCVBUF and SO_SNDBUF.  Setting this size may be necessary for large
-    volume scenarios, for which also `-B` might apply.  Checking the *Recv-Q*
-    and the *receive errors* values from *netstat* gives a good hint
-    about buffer usage.
+    Sets the socket send/receive buffer sizes in bytes.  When unset, the
+    OS default is used.  The maximum is also determined by the OS.  The
+    sizes are set using setsockopt with the flags SO_RCVBUF and
+    SO_SNDBUF.  Setting this size may be necessary for large volume
+    scenarios, for which also `-B` might apply.
 
   * `-T` *timeout*:
     Specifies the IO timeout in milliseconds used for server connections.
@@ -227,12 +238,6 @@ statistics
     [prefix with <prefix>]
     [send to <cluster ...>]
     [stop]
-    ;
-
-listen
-    <linemode [gzip | bzip2 | lzma | ssl]>
-        <<interface[:port] | port> proto <udp | tcp>> ...
-        </ptah/to/file proto unix> ...
     ;
 
 include </path/to/file/or/glob>
@@ -323,10 +328,6 @@ taken with the latter to avoid log flooding.  When a validate clause is
 present, destinations need not to be present, this allows for applying a
 global validation rule.  Note that the cleansing rules are applied
 before validation is done, thus the data will not have duplicate spaces.
-The `route using` clause is used to perform a temporary modification to
-the key used for input to the consistent hashing routines.  The primary
-purpose is to route traffic so that appropriate data is sent to the
-needed aggregation instances.
 
 Rewrite rules take a regular expression as input to match incoming
 metrics, and transform them into the desired new metric name.  In the
@@ -779,7 +780,7 @@ The following metrics are produced under the `carbon.relays.<hostname>`
 namespace:
 
 * metricsReceived
-
+  
   The number of metrics that were received by the relay.  Received here
   means that they were seen and processed by any of the dispatchers.
 

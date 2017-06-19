@@ -18,7 +18,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <string.h>
 #include <ctype.h>
 #include <glob.h>
@@ -53,7 +52,6 @@ struct _router {
 		char *prefix;
 		col_mode mode;
 	} collector;
-	listener *listeners;
 	struct _router_parser_err {
 		const char *msg;
 		size_t line;
@@ -61,7 +59,6 @@ struct _router {
 		size_t stop;
 	} parser_err;
 	struct _router_conf {
-		char workercnt;
 		size_t queuesize;
 		size_t batchsize;
 		int maxstalls;
@@ -76,37 +73,33 @@ int router_yylex_init(void **);
 void router_yy_scan_string(char *, void *);
 int router_yylex_destroy(void *);
 
+/* custom constant, meant to force regex mode matching */
+#define REG_FORCE   01000000
+
 /* catch string used for aggrgator destinations */
 #define STUB_AGGR   "_aggregator_stub_"
 /* catch string used for collector output */
 #define STUB_STATS  "_collector_stub_"
 
 /**
- * Frees regexes from routes.
+ * Frees routes and clusters.
  */
 static void
-router_free_intern(route *routes, char workercnt)
+router_free_intern(cluster *clusters, route *routes)
 {
-	/* the only thing that isn't allocated using the allocators are the
-	 * regexes */
 	while (routes != NULL) {
-		if (routes->matchtype == REGEX) {
-			int i;
-			for(i = 0; i < workercnt; i++)
-				regfree(&routes->rule[i]);
-		}
+		if (routes->matchtype == REGEX)
+			regfree(&routes->rule);
 
 		if (routes->next == NULL || routes->next->dests != routes->dests) {
 			while (routes->dests != NULL) {
 				if (routes->dests->cl->type == GROUP ||
 						routes->dests->cl->type == AGGRSTUB ||
 						routes->dests->cl->type == STATSTUB)
-					router_free_intern(routes->dests->cl->members.routes,
-							workercnt);
+					router_free_intern(NULL, routes->dests->cl->members.routes);
 				if (routes->dests->cl->type == VALIDATION)
-					router_free_intern(
-							routes->dests->cl->members.validation->rule,
-							workercnt);
+					router_free_intern(NULL,
+							routes->dests->cl->members.validation->rule);
 
 				routes->dests = routes->dests->next;
 			}
@@ -114,13 +107,45 @@ router_free_intern(route *routes, char workercnt)
 
 		routes = routes->next;
 	}
+
+	while (clusters != NULL) {
+		switch (clusters->type) {
+			case CARBON_CH:
+			case FNV1A_CH:
+			case JUMP_CH:
+				ch_free(clusters->members.ch->ring);
+				break;
+			case FORWARD:
+			case FILELOG:
+			case FILELOGIP:
+			case BLACKHOLE:
+			case ANYOF:
+			case FAILOVER:
+				/* no special structures to free */
+				break;
+			case GROUP:
+			case AGGRSTUB:
+			case STATSTUB:
+			case VALIDATION:
+				/* handled at the routes above */
+				break;
+			case AGGREGATION:
+				/* aggregators starve when they get no more input */
+				break;
+			case REWRITE:
+				/* everything is in the allocators */
+				break;
+		}
+
+		clusters = clusters->next;
+	}
 }
 
 /**
  * Examines pattern and sets matchtype and rule or strmatch in route.
  */
-static inline int
-determine_if_regex(allocator *a, char workercnt, route *r, char *pat)
+static int
+determine_if_regex(route *r, char *pat, int flags)
 {
 	/* try and see if we can avoid using a regex match, for
 	 * it is simply very slow/expensive to do so: most of
@@ -131,6 +156,11 @@ determine_if_regex(allocator *a, char workercnt, route *r, char *pat)
 	char escape = 0;
 	r->matchtype = CONTAINS;
 	r->nmatch = 0;
+
+	if (flags & REG_FORCE) {
+		flags &= ~REG_NOSUB;
+		r->matchtype = REGEX;
+	}
 
 	if (*e == '^' && r->matchtype == CONTAINS) {
 		e++;
@@ -188,43 +218,27 @@ determine_if_regex(allocator *a, char workercnt, route *r, char *pat)
 	}
 	if (r->matchtype != REGEX) {
 		*pb = '\0';
-		r->strmatch = ra_strdup(a, patbuf);
-		r->pattern = ra_strdup(a, pat);
+		r->strmatch = strdup(patbuf);
+		r->pattern = strdup(pat);
 	} else {
-		int i;
-		int ret;
-
-		r->rule = ra_malloc(a, sizeof(*r->rule) * workercnt);
-		if (r->rule == NULL) {
-			logerr("determine_if_regex: malloc failed for "
-					"regular expressions\n");
-			return REG_ESPACE;  /* lie closest to the truth */
-		}
-		ret = regcomp(&r->rule[0], pat, REG_EXTENDED);
+		int ret = regcomp(&r->rule, pat, flags & ~REG_FORCE);
 		if (ret != 0)
 			return ret;  /* allow use of regerror */
-		if (r->rule[0].re_nsub > 0) {
+		r->strmatch = NULL;
+		r->pattern = strdup(pat);
+		if (((flags & REG_NOSUB) == 0 && r->rule.re_nsub > 0) ||
+				flags & REG_FORCE)
+		{
 			/* we need +1 because position 0 contains the entire
 			 * expression */
-			r->nmatch = r->rule[0].re_nsub + 1;
+			r->nmatch = r->rule.re_nsub + 1;
 			if (r->nmatch > RE_MAX_MATCHES) {
 				logerr("determine_if_regex: too many match groups, "
 						"please increase RE_MAX_MATCHES in router.h\n");
-				regfree(&r->rule[0]);
+				free(r->pattern);
 				return REG_ESPACE;  /* lie closest to the truth */
 			}
 		}
-		for (i = 1; i < workercnt; i++) {
-			if (regcomp(&r->rule[i], pat, REG_EXTENDED) != 0) {
-				while (--i >= 0)
-					regfree(&r->rule[i]);
-				logerr("determine_if_regex: out of memory allocating "
-						"regexes\n");
-				return REG_ESPACE;  /* lie closest to the truth */
-			}
-		}
-		r->strmatch = NULL;
-		r->pattern = ra_strdup(a, pat);
 	}
 
 	return 0;
@@ -356,10 +370,11 @@ router_validate_address(
 		char **retip, int *retport, void **retsaddr, void **rethint,
 		char *ip, serv_ctype proto)
 {
-	int port = GRAPHITE_PORT;
+	int port = 2003;
 	struct addrinfo *saddr = NULL;
 	struct addrinfo hint;
 	char sport[8];
+	char hnbuf[256];
 	char *p;
 	char *lastcolon = NULL;
 
@@ -386,21 +401,19 @@ router_validate_address(
 			return(ra_strdup(rtr->a, "expected ']'"));
 		}
 	}
-	if (lastcolon == ip)
-		ip = NULL;  /* only resolve port, e.g. any interface */
 
+	/* try to see if this is a "numeric" IP address, in
+	 * which case we take the cannonical representation so
+	 * as to ensure (string) comparisons will match lateron */
 	memset(&hint, 0, sizeof(hint));
 	saddr = NULL;
 
-	/* try to see if this is a "numeric" IP address, which means
-	 * re-resolving lateron will make no difference */
 	hint.ai_family = PF_UNSPEC;
 	hint.ai_socktype = proto == CON_UDP ? SOCK_DGRAM : SOCK_STREAM;
 	hint.ai_protocol = proto == CON_UDP ? IPPROTO_UDP : IPPROTO_TCP;
-	hint.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV | AI_PASSIVE;
+	hint.ai_flags = AI_NUMERICHOST | AI_NUMERICSERV;
 	snprintf(sport, sizeof(sport), "%u", port);
 
-	*rethint = NULL;
 	if (getaddrinfo(ip, sport, &hint, &saddr) != 0) {
 		int err;
 		/* now resolve this the normal way to check validity */
@@ -408,8 +421,7 @@ router_validate_address(
 		if ((err = getaddrinfo(ip, sport, &hint, &saddr)) != 0) {
 			char errmsg[512];
 			snprintf(errmsg, sizeof(errmsg), "failed to resolve %s, port %s, "
-					"proto %s: %s", ip == NULL ? "<any>" : ip, sport,
-					proto == CON_UDP ? "udp" : "tcp",
+					"proto %s: %s", ip, sport, proto == CON_UDP ? "udp" : "tcp",
 					gai_strerror(err));
 			return(ra_strdup(rtr->a, errmsg));
 		}
@@ -419,6 +431,22 @@ router_validate_address(
 		if (*rethint == NULL)
 			return(ra_strdup(rtr->a, "out of memory copying hint structure"));
 		memcpy(*rethint, &hint, sizeof(hint));
+	} else {
+		/* serialise the IP address, to make sure we use cannonical form
+		 * which we can then string-match lateron (to do duplicate
+		 * detection) */
+		*rethint = NULL;
+		if (saddr->ai_family == AF_INET) {
+			if (inet_ntop(saddr->ai_family,
+						&((struct sockaddr_in *)saddr->ai_addr)->sin_addr,
+						hnbuf, sizeof(hnbuf)) != NULL)
+				ip = ra_strdup(rtr->a, hnbuf);
+		} else if (saddr->ai_family == AF_INET6) {
+			if (inet_ntop(saddr->ai_family,
+						&((struct sockaddr_in6 *)saddr->ai_addr)->sin6_addr,
+						hnbuf, sizeof(hnbuf)) != NULL)
+				ip = ra_strdup(rtr->a, hnbuf);
+		}
 	}
 
 	*retip = ip;
@@ -435,31 +463,20 @@ router_validate_path(router *rtr, char *path)
 {
 	struct stat st;
 	char fileexists = 1;
-	int probefd;
+	FILE *probe;
 
 	/* if the file doesn't exist, remove it after trying to create it */
 	if (stat(path, &st) == -1)
 		fileexists = 0;
 
-	if ((probefd = open(path,
-					O_WRONLY | O_APPEND | O_CREAT,
-					S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) < 0)
-	{
+	if ((probe = fopen(path, "w+")) == NULL) {
 		char errbuf[512];
-		if (errno == EOPNOTSUPP && st.st_mode & S_IFSOCK) {
-			/* This is pretty lame, but I don't know a better way: we
-			 * can't open sockets in use, and as it stands we can't
-			 * check it is *us* who have the socket in use.  So, we
-			 * assume we do, and ignore this silently.  In the worst
-			 * case this yields an error when it opens up for real. */
-			return NULL;
-		}
 		snprintf(errbuf, sizeof(errbuf),
 				"failed to open file '%s' for writing: %s",
 				path, strerror(errno));
 		return ra_strdup(rtr->a, errbuf);
 	}
-	close(probefd);
+	fclose(probe);
 
 	if (!fileexists)
 		unlink(path);
@@ -473,7 +490,7 @@ router_validate_path(router *rtr, char *path)
  * struct is allocated.
  */
 char *
-router_validate_expression(router *rtr, route **retr, char *pat)
+router_validate_expression(router *rtr, route **retr, char *pat, char subst)
 {
 	route *r = *retr;
 	if (r == NULL) {
@@ -488,12 +505,13 @@ router_validate_expression(router *rtr, route **retr, char *pat)
 		r->strmatch = NULL;
 		r->matchtype = MATCHALL;
 	} else {
-		int err = determine_if_regex(rtr->a, rtr->conf.workercnt, r, pat);
+		int err = determine_if_regex(r, pat,
+				REG_EXTENDED | (subst ? 0 : REG_NOSUB));
 		if (err != 0) {
 			char ebuf[512];
 			size_t s = snprintf(ebuf, sizeof(ebuf),
 					"invalid expression '%s': ", pat);
-			regerror(err, &r->rule[0], ebuf + s, sizeof(ebuf) - s);
+			regerror(err, &r->rule, ebuf + s, sizeof(ebuf) - s);
 			return ra_strdup(rtr->a, ebuf);
 		}
 	}
@@ -543,8 +561,7 @@ router_add_server(
 		cluster *cl)
 {
 	struct addrinfo *walk;
-	struct addrinfo *lwalk;
-	char hnbuf[INET6_ADDRSTRLEN];
+	char hnbuf[256];
 	char errbuf[512];
 	server *newserver;
 	servers *w = NULL;
@@ -552,26 +569,29 @@ router_add_server(
 	walk = saddrs;  /* NULL if file */
 	do {
 		servers *s;
-		lwalk = NULL;
 
 		if (useall) {
 			/* serialise the IP address, to make the targets explicit
 			 * (since we're expanding all A/AAAA records) */
-			saddr_ntop(walk, hnbuf);
-			if (hnbuf[0] != '\0')
-				ip = hnbuf;
-			/* now we've expanded, don't trigger re-resolving */
-			if (hint)
-				free(hint);
-			hint = NULL;
-			/* and turn this into a separate entry */
-			lwalk = walk->ai_next;
-			walk->ai_next = NULL;
+			if (walk->ai_family == AF_INET) {
+				if (inet_ntop(walk->ai_family,
+							&((struct sockaddr_in *)walk->ai_addr)->sin_addr,
+							hnbuf, sizeof(hnbuf)) != NULL)
+					ip = hnbuf;
+			} else if (walk->ai_family == AF_INET6) {
+				if (inet_ntop(walk->ai_family,
+							&((struct sockaddr_in6 *)walk->ai_addr)->sin6_addr,
+							hnbuf, sizeof(hnbuf)) != NULL)
+					ip = hnbuf;
+			}
 		}
 
 		newserver = NULL;
 		for (s = ret->srvrs; s != NULL; s = s->next) {
-			if (server_cmp(s->server, walk, ip) == 0) {
+			if (strcmp(server_ip(s->server), ip) == 0 &&
+					server_port(s->server) == port &&
+					server_ctype(s->server) == proto)
+			{
 				newserver = s->server;
 				s->refcnt++;
 				break;
@@ -579,7 +599,7 @@ router_add_server(
 		}
 		if (newserver == NULL) {
 			newserver = server_new(ip, (unsigned short)port,
-					proto, walk, hint,
+					proto, saddrs, hint,
 					ret->conf.queuesize, ret->conf.batchsize,
 					ret->conf.maxstalls, ret->conf.iotimeout,
 					ret->conf.sockbufsize);
@@ -754,7 +774,7 @@ router_add_server(
 			}
 		}
 
-		walk = lwalk;
+		walk = useall ? walk->ai_next : NULL;
 	} while (walk != NULL);
 
 	return NULL;
@@ -929,99 +949,11 @@ router_add_stubroute(
 }
 
 char *
-router_add_listener(
-		router *rtr,
-		rcptr_lsnrtype ltype,
-		rcptr_transport trnsp,
-		serv_ctype ctype,
-		char *ip,
-		int port,
-		struct addrinfo *saddrs)
-{
-	listener *lwalk;
-	listener *prevl;
-	struct addrinfo *swalk;
-	struct addrinfo *lswalk;
-	int addrcnt;
-
-	if (rtr->listeners == NULL) {
-		lwalk = rtr->listeners =
-			ra_malloc(rtr->a, sizeof(listener));
-	} else {
-		char hnbufl[INET6_ADDRSTRLEN];
-		char hnbufr[INET6_ADDRSTRLEN];
-
-		prevl = NULL;
-		for (lwalk = rtr->listeners; lwalk != NULL; lwalk = lwalk->next) {
-			for (swalk = saddrs; swalk != NULL; swalk = swalk->ai_next) {
-				saddr_ntop(swalk, hnbufl);
-				if (lwalk->ctype == ctype && lwalk->port == port) {
-					for (lswalk = lwalk->saddrs; lswalk != NULL;
-							lswalk = lswalk->ai_next)
-					{
-						saddr_ntop(lswalk, hnbufr);
-						/* ip is equal if:
-						 * - the address family is the same (ipv4/ipv6)
-						 * - at least one of the sides is 0.0.0.0 (ipv4 any)
-						 * - at least one of the sides is :: (ipv6 any)
-						 * - both sides are equal */
-						if (swalk->ai_family == lswalk->ai_family && (
-								strcmp(hnbufl, "0.0.0.0") == 0 ||
-								strcmp(hnbufr, "0.0.0.0") == 0 ||
-								strcmp(hnbufl, "::") == 0 ||
-								strcmp(hnbufr, "::") == 0 ||
-								strcmp(hnbufl, hnbufr) == 0))
-						{
-							char msg[256];
-							snprintf(msg, sizeof(msg),
-									"duplicate listener %s with %s for port %d",
-									hnbufl, hnbufr, port);
-							return ra_strdup(rtr->a, msg);
-						}
-					}
-				}
-			}
-			if (saddrs == NULL) { /* UNIX */
-				if (lwalk->ctype == ctype && strcmp(lwalk->ip, ip) == 0) {
-					char msg[256];
-					snprintf(msg, sizeof(msg), "duplicate listener %s", ip);
-					return ra_strdup(rtr->a, msg);
-				}
-			}
-			prevl = lwalk;
-		}
-		lwalk = prevl->next =
-			ra_malloc(rtr->a, sizeof(listener));
-	}
-	if (lwalk == NULL)
-		return ra_strdup(rtr->a, "malloc failed for listener struct");
-
-	lwalk->lsnrtype = ltype;
-	lwalk->transport = trnsp;
-	lwalk->ctype = ctype;
-	lwalk->ip = ip == NULL ? ip : ra_strdup(rtr->a, ip);
-	lwalk->port = port;
-	lwalk->socks = NULL;
-	lwalk->saddrs = saddrs;
-	lwalk->next = NULL;
-
-	addrcnt = saddrs == NULL ? 1 : 0;
-	for (swalk = saddrs; swalk != NULL; swalk = swalk->ai_next)
-		addrcnt++;
-	lwalk->socks = ra_malloc(rtr->a, sizeof(int) * (addrcnt + 1));
-	if (lwalk->socks == NULL)
-		return ra_strdup(rtr->a, "malloc failed for sockets");
-	lwalk->socks[0] = -1;
-
-	return NULL;
-}
-
-inline char *
 router_set_statistics(router *rtr, destinations *dsts)
 {
 	if (rtr->collector.stub != NULL)
 		return ra_strdup(rtr->a,
-				"duplicate 'statistics send to' not allowed, "
+				"duplicate 'send statistics to' not allowed, "
 				"use multiple destinations instead");
 
 	return router_add_stubroute(rtr, STATSTUB, NULL, dsts);
@@ -1033,13 +965,11 @@ router_set_statistics(router *rtr, destinations *dsts)
 router *
 router_readconfig(router *orig,
 		const char *path,
-		char workercnt,
 		size_t queuesize,
 		size_t batchsize,
 		int maxstalls,
 		unsigned short iotimeout,
-		unsigned int sockbufsize,
-		unsigned short listenport)
+		unsigned int sockbufsize)
 {
 	FILE *cnf;
 	char *buf;
@@ -1084,8 +1014,8 @@ router_readconfig(router *orig,
 		ret = orig;
 		for (i = 0; i < globbuf.gl_pathc; i++) {
 			globpath = globbuf.gl_pathv[i];
-			ret = router_readconfig(ret, globpath, workercnt, queuesize,
-					batchsize, maxstalls, iotimeout, sockbufsize, listenport);
+			ret = router_readconfig(ret, globpath, queuesize,
+					batchsize, maxstalls, iotimeout, sockbufsize);
 			if (ret == NULL) {
 				/* readconfig will have freed when it found the error */
 				break;
@@ -1133,9 +1063,6 @@ router_readconfig(router *orig,
 		}
 		ret->collector.stub = NULL;
 
-		ret->listeners = NULL;
-
-		ret->conf.workercnt = workercnt;
 		ret->conf.queuesize = queuesize;
 		ret->conf.batchsize = batchsize;
 		ret->conf.maxstalls = maxstalls;
@@ -1168,14 +1095,12 @@ router_readconfig(router *orig,
 
 	if ((buf = ra_malloc(palloc, st.st_size + 1)) == NULL) {
 		logerr("malloc failed for config file buffer\n");
-		ra_free(palloc);
 		router_free(ret);
 		return NULL;
 	}
 
 	if ((cnf = fopen(path, "r")) == NULL) {
 		logerr("failed to open config file '%s': %s\n", path, strerror(errno));
-		ra_free(palloc);
 		router_free(ret);
 		return NULL;
 	}
@@ -1187,7 +1112,6 @@ router_readconfig(router *orig,
 
 	if (router_yylex_init(&lptr) != 0) {
 		logerr("lex init failed\n");
-		ra_free(palloc);
 		router_free(ret);
 		return NULL;
 	}
@@ -1195,8 +1119,9 @@ router_readconfig(router *orig,
 	router_yy_scan_string(buf, lptr);
 	ret->parser_err.msg = NULL;
 	if (router_yyparse(lptr, ret, ret->a, palloc) != 0) {
-		/* parser_err.msg can be NULL on cascading, see below */
-		if (ret->parser_err.line != 0) {
+		if (ret->parser_err.msg == NULL) {
+			fprintf(stderr, "parsing %s failed\n", path);
+		} else if (ret->parser_err.line != 0) {
 			char *line;
 			char *p;
 			char *carets;
@@ -1226,51 +1151,16 @@ router_readconfig(router *orig,
 					*p = ' ';
 			*p = '\0';
 			fprintf(stderr, "%s%s\n", line, carets);
-		} else if (ret->parser_err.msg != NULL) {
+		} else {
 			fprintf(stderr, "%s: %s\n", path, ret->parser_err.msg);
 		}
-		/* clear the message, so it isn't printed when this was an
-		 * included config */
-		ret->parser_err.msg = NULL;
 		router_yylex_destroy(lptr);
-		ra_free(palloc);
 		router_free(ret);
+		ra_free(palloc);
 		return NULL;
 	}
 	router_yylex_destroy(lptr);
 	ra_free(palloc);
-
-	if (orig == NULL) {
-		/* set defaults if absent */
-		if (ret->listeners == NULL) {
-			char sockbuf[128];
-			char *ip;
-			int port;
-			void *saddrs;
-			void *hint;
-
-			hint = NULL;
-			snprintf(sockbuf, sizeof(sockbuf), ":%u", listenport);
-			router_validate_address(ret, &ip, &port, &saddrs, &hint,
-					sockbuf, CON_TCP);
-			free(hint);
-			router_add_listener(ret, LSNR_LINE, W_PLAIN, CON_TCP,
-					ip, port, saddrs);
-
-			hint = NULL;
-			snprintf(sockbuf, sizeof(sockbuf), ":%u", listenport);
-			router_validate_address(ret, &ip, &port, &saddrs, &hint,
-					sockbuf, CON_UDP);
-			free(hint);
-			router_add_listener(ret, LSNR_LINE, W_PLAIN, CON_UDP,
-					ip, port, saddrs);
-
-			snprintf(sockbuf, sizeof(sockbuf), "%s/%s.%u",
-					TMPDIR, SOCKFILE, listenport);
-			router_add_listener(ret, LSNR_LINE, W_PLAIN, CON_UNIX,
-					sockbuf, 0, NULL);
-		}
-	}
 
 	return ret;
 }
@@ -1332,7 +1222,7 @@ router_optimise(router *r, int threshold)
 	 * before determining that an input metric cannot match any
 	 * expression we have defined. */
 	seq = 0;
-	blast = bstart = blocks = ra_malloc(r->a, sizeof(block));
+	blast = bstart = blocks = malloc(sizeof(block));
 	blocks->refcnt = 0;
 	blocks->pattern = NULL;
 	blocks->hash = 0;
@@ -1344,7 +1234,7 @@ router_optimise(router *r, int threshold)
 		/* matchall and rewrite rules cannot be in a group (issue #218) */
 		if (rwalk->matchtype == MATCHALL || rwalk->dests->cl->type == REWRITE) {
 			tracef("skipping %s\n", rwalk->pattern ? rwalk->pattern : "*");
-			blast->next = ra_malloc(r->a, sizeof(block));
+			blast->next = malloc(sizeof(block));
 			blast->next->prev = blast;
 			blast = blast->next;
 			blast->pattern = NULL;
@@ -1390,7 +1280,7 @@ router_optimise(router *r, int threshold)
 		if (p == rwalk->pattern) {
 			/* nothing we can do with a pattern like this */
 			tracef("skipping unusable %s\n", p);
-			blast->next = ra_malloc(r->a, sizeof(block));
+			blast->next = malloc(sizeof(block));
 			blast->next->prev = blast;
 			blast = blast->next;
 			blast->pattern = NULL;
@@ -1427,7 +1317,7 @@ router_optimise(router *r, int threshold)
 			/* this probably isn't selective enough, don't put in a group */
 			tracef("skipping too small pattern %s from %s\n",
 					b, rwalk->pattern);
-			blast->next = ra_malloc(r->a, sizeof(block));
+			blast->next = malloc(sizeof(block));
 			blast->next->prev = blast;
 			blast = blast->next;
 			blast->pattern = NULL;
@@ -1454,10 +1344,10 @@ router_optimise(router *r, int threshold)
 		}
 		if (bwalk == NULL) {
 			tracef("creating new group %s for %s\n", b, rwalk->pattern);
-			blast->next = ra_malloc(r->a, sizeof(block));
+			blast->next = malloc(sizeof(block));
 			blast->next->prev = blast;
 			blast = blast->next;
-			blast->pattern = ra_strdup(r->a, b);
+			blast->pattern = strdup(b);
 			blast->hash = bsum;
 			blast->refcnt = 1;
 			blast->seqnr = seq;
@@ -1514,6 +1404,7 @@ router_optimise(router *r, int threshold)
 
 		if (bwalk->refcnt == 0) {
 			blast = bwalk->next;
+			free(bwalk);
 			continue;
 		} else if (bwalk->refcnt < 3) {
 			if (r->routes == NULL) {
@@ -1523,17 +1414,19 @@ router_optimise(router *r, int threshold)
 			}
 			rwalk = bwalk->lastroute;
 			blast = bwalk->next;
+			free(bwalk->pattern);
+			free(bwalk);
 		} else {
 			if (r->routes == NULL) {
-				rwalk = r->routes = ra_malloc(r->a, sizeof(route));
+				rwalk = r->routes = malloc(sizeof(route));
 			} else {
-				rwalk = rwalk->next = ra_malloc(r->a, sizeof(route));
+				rwalk = rwalk->next = malloc(sizeof(route));
 			}
 			rwalk->pattern = NULL;
 			rwalk->stop = 0;
 			rwalk->matchtype = CONTAINS;
-			rwalk->dests = ra_malloc(r->a, sizeof(destinations));
-			rwalk->dests->cl = ra_malloc(r->a, sizeof(cluster));
+			rwalk->dests = malloc(sizeof(destinations));
+			rwalk->dests->cl = malloc(sizeof(cluster));
 			rwalk->dests->cl->name = bwalk->pattern;
 			rwalk->dests->cl->type = GROUP;
 			rwalk->dests->cl->members.routes = bwalk->firstroute;
@@ -1541,6 +1434,7 @@ router_optimise(router *r, int threshold)
 			rwalk->dests->next = NULL;
 			rwalk->next = NULL;
 			blast = bwalk->next;
+			free(bwalk);
 		}
 	}
 }
@@ -1626,7 +1520,7 @@ router_getcollectormode(router *rtr)
 inline char *
 router_set_collectorvals(router *rtr, int intv, char *prefix, col_mode smode)
 {
-	if (intv >= 0)
+	if (intv > 0)
 		rtr->collector.interval = intv;
 	if (prefix != NULL) {
 		regex_t re;
@@ -1638,18 +1532,13 @@ router_set_collectorvals(router *rtr, int intv, char *prefix, col_mode smode)
 
 		if (regcomp(&re, expr, REG_EXTENDED) != 0)
 			return ra_strdup(rtr->a, "failed to compile hostname regexp");
-		if (regexec(&re, relay_hostname, nmatch, pmatch, 0) != 0) {
-			regfree(&re);
-			return ra_strdup(rtr->a, "failed to execute hostname regexp");
-		}
+		if (regexec(&re, relay_hostname, nmatch, pmatch, 0) != 0)
+			return ra_strdup(rtr->a, "failed to execute hostname regext");
 		if (router_rewrite_metric(
 				&cprefix, &dummy,
 				relay_hostname, dummy, prefix,
 				nmatch, pmatch) == 0)
-		{
-			regfree(&re);
 			return ra_strdup(rtr->a, "rewriting statistics prefix failed");
-		}
 		regfree(&re);
 		rtr->collector.prefix = ra_strdup(rtr->a, cprefix);
 		if (rtr->collector.prefix == NULL)
@@ -1674,38 +1563,6 @@ router_printconfig(router *rtr, FILE *f, char pmode)
 	servers *s;
 
 	/* start with configuration wise standard components */
-#define PPROTO \
-	server_ctype(s->server) == CON_UDP ? " proto udp" : ""
-
-	if (rtr->listeners != NULL) {
-		listener *walk;
-		fprintf(f, "listen\n");
-		for (walk = rtr->listeners; walk != NULL; walk = walk->next) {
-			if (walk->lsnrtype == LSNR_LINE) {
-				fprintf(f, "    linemode%s\n",
-						walk->transport == W_PLAIN ? "" :
-						walk->transport == W_GZIP  ? " gzip" :
-						walk->transport == W_BZIP2 ? " bzip2" :
-						walk->transport == W_LZMA  ? " lzma" :
-						walk->transport == W_SSL   ? " ssl" : " unknown");
-				do {
-					if (walk->ctype == CON_UNIX) {
-						fprintf(f, "        %s proto unix\n", walk->ip);
-					} else {
-						fprintf(f, "        %s%s%u proto %s\n",
-								walk->ip == NULL ? "" : walk->ip,
-								walk->ip == NULL ? "" : ":",
-								walk->port,
-								walk->ctype == CON_UDP ? "udp" : "tcp");
-					}
-				} while (walk->next != NULL
-						&& walk->lsnrtype == walk->next->lsnrtype
-						&& walk->transport == walk->next->transport
-						&& (walk = walk->next) != NULL);
-			}
-		}
-		fprintf(f, "    ;\n\n");
-	}
 	if (rtr->collector.interval > 0) {
 		fprintf(f, "statistics\n    submit every %d seconds\n",
 				rtr->collector.interval);
@@ -1732,6 +1589,9 @@ router_printconfig(router *rtr, FILE *f, char pmode)
 
 		fprintf(f, "\n");
 	}
+
+#define PPROTO \
+	server_ctype(s->server) == CON_UDP ? " proto udp" : ""
 
 	for (c = rtr->clusters; c != NULL; c = c->next) {
 		if (c->type == BLACKHOLE || c->type == REWRITE ||
@@ -1912,8 +1772,6 @@ router_printconfig(router *rtr, FILE *f, char pmode)
 				/* hide this pseudo target */
 				d = d->next;
 			}
-			if (r->masq != NULL)
-				fprintf(f, "    route using %s\n", r->masq);
 			if (d != NULL) {
 				fprintf(f, "    send to");
 				if (d->next == NULL) {
@@ -2035,79 +1893,6 @@ router_transplant_queues(router *new, router *old)
 	}
 }
 
-inline listener *
-router_get_listeners(router *rtr)
-{
-	return rtr->listeners;
-}
-
-/**
- * Returns whether a comparible listener to lsnr exists in router rtr.
- * Comparible means they are the same hostname, or have canonical ip
- * representation that matches.
- */
-char
-router_contains_listener(router *rtr, listener *lsnr)
-{
-	listener *rwalk;
-	char hnbufl[INET6_ADDRSTRLEN];
-	char hnbufr[INET6_ADDRSTRLEN];
-	char match;
-
-	match = 0;
-
-	if (lsnr->saddrs)
-		saddr_ntop(lsnr->saddrs, hnbufl);
-	for (rwalk = rtr->listeners; rwalk != NULL; rwalk = rwalk->next) {
-		if (rwalk->saddrs)
-			saddr_ntop(rwalk->saddrs, hnbufr);
-		if (lsnr->transport == rwalk->transport && lsnr->ctype == rwalk->ctype)
-		{
-			if (lsnr->ctype == CON_UNIX) {
-				if (strcmp(lsnr->ip, rwalk->ip) == 0) {
-					match = 1;
-					break;
-				}
-			} else {
-				char *p;
-				char *l, *r;
-
-				/* compare against user input, but try to cannonicalise
-				 * IP addresses in order to get correct matches */
-				if (lsnr->ip != NULL) {
-					for (p = lsnr->ip ; strchr("0123456789.:", *p) != 0; p++)
-						;
-					if (*p != '\0') {
-						l = lsnr->ip;
-					} else {
-						l = hnbufl;
-					}
-				} else {
-					l = hnbufl;
-				}
-				if (rwalk->ip != NULL) {
-					for (p = rwalk->ip ; strchr("0123456789.:", *p) != 0; p++)
-						;
-					if (*p != '\0') {
-						r = rwalk->ip;
-					} else {
-						r = hnbufr;
-					}
-				} else {
-					r = hnbufr;
-				}
-
-				if (lsnr->port == rwalk->port && strcmp(l, r) == 0) {
-					match = 1;
-					break;
-				}
-			}
-		}
-	}
-
-	return match;
-}
-
 /**
  * Starts all resources (servers) associated to this router.
  */
@@ -2151,7 +1936,7 @@ router_free(router *rtr)
 {
 	servers *s;
 
-	router_free_intern(rtr->routes, rtr->conf.workercnt);
+	router_free_intern(rtr->clusters, rtr->routes);
 
 	/* free all servers from the pool, in case of secondaries, the
 	 * previous call to router_shutdown made sure nothing references the
@@ -2168,15 +1953,10 @@ router_metric_matches(
 		const route *r,
 		char *metric,
 		char *firstspace,
-		regmatch_t *pmatch,
-		int dispatcher_id)
+		regmatch_t *pmatch)
 {
 	char ret = 0;
 	char firstspc = *firstspace;
-	union {
-		char *c;
-		size_t i;
-	} t;
 
 	switch (r->matchtype) {
 		case MATCHALL:
@@ -2184,43 +1964,27 @@ router_metric_matches(
 			break;
 		case REGEX:
 			*firstspace = '\0';
-			ret = regexec(&r->rule[dispatcher_id], metric, r->nmatch, pmatch, 0) == 0;
+			ret = regexec(&r->rule, metric, r->nmatch, pmatch, 0) == 0;
 			*firstspace = firstspc;
 			break;
 		case CONTAINS:
 			*firstspace = '\0';
-			ret = (t.c = strstr(metric, r->strmatch)) != NULL;
-			if (ret) {
-				pmatch[0].rm_so = t.c - metric;
-				pmatch[0].rm_eo = pmatch[0].rm_so + strlen(r->strmatch);
-			}
+			ret = strstr(metric, r->strmatch) != NULL;
 			*firstspace = firstspc;
 			break;
 		case STARTS_WITH:
-			t.i = strlen(r->strmatch);
-			ret = strncmp(metric, r->strmatch, t.i) == 0;
-			if (ret) {
-				pmatch[0].rm_so = 0;
-				pmatch[0].rm_eo = t.i;
-			}
+			ret = strncmp(metric, r->strmatch, strlen(r->strmatch)) == 0;
 			break;
 		case ENDS_WITH:
 			*firstspace = '\0';
-			t.i = strlen(r->strmatch);
-			ret = strcmp(firstspace - t.i, r->strmatch) == 0;
-			if (ret) {
-				pmatch[0].rm_so = firstspace - t.i - metric;
-				pmatch[0].rm_eo = pmatch[0].rm_so + t.i;
-			}
+			ret = strcmp(
+					firstspace - strlen(r->strmatch),
+					r->strmatch) == 0;
 			*firstspace = firstspc;
 			break;
 		case MATCHES:
 			*firstspace = '\0';
 			ret = strcmp(metric, r->strmatch) == 0;
-			if (ret) {
-				pmatch[0].rm_so = 0;
-				pmatch[0].rm_eo = strlen(r->strmatch);
-			}
 			*firstspace = firstspc;
 			break;
 		default:
@@ -2393,8 +2157,7 @@ router_route_intern(
 		char *srcaddr,
 		char *metric,
 		char *firstspace,
-		const route *r,
-		int dispatcher_id)
+		const route *r)
 {
 	const route *w;
 	destinations *d;
@@ -2445,9 +2208,8 @@ router_route_intern(
 						srcaddr,
 						metric,
 						firstspace,
-						w->dests->cl->members.routes,
-						dispatcher_id);
-		} else if (router_metric_matches(w, metric, firstspace, pmatch, dispatcher_id)) {
+						w->dests->cl->members.routes);
+		} else if (router_metric_matches(w, metric, firstspace, pmatch)) {
 			stop = w->stop;
 			/* rule matches, send to destination(s) */
 			for (d = w->dests; d != NULL; d = d->next) {
@@ -2524,26 +2286,12 @@ router_route_intern(
 						/* let the ring(bearer) decide */
 						failif(retsize,
 								*curlen + d->cl->members.ch->repl_factor);
-						if (w->masq != NULL) {
-							if ((len = router_rewrite_metric(
-										&newmetric, &newfirstspace,
-										metric, firstspace,
-										w->masq,
-										w->nmatch, pmatch)) == 0)
-							{
-								logerr("router_route: failed to route using: "
-										"newmetric size too small to hold "
-										"replacement (%s -> %s)\n",
-										metric, w->masq);
-								break;
-							}
-						}
 						ch_get_nodes(
 								&ret[*curlen],
 								d->cl->members.ch->ring,
 								d->cl->members.ch->repl_factor,
-								w->masq ? newmetric : metric,
-								w->masq ? newfirstspace : firstspace);
+								metric,
+								firstspace);
 						*curlen += d->cl->members.ch->repl_factor;
 						wassent = 1;
 					}	break;
@@ -2591,9 +2339,8 @@ router_route_intern(
 								retsize,
 								srcaddr,
 								metric + strlen(w->pattern),
-								firstspace,
-								w->dests->cl->members.routes,
-								dispatcher_id);
+								firstspace + strlen(w->pattern),
+								w->dests->cl->members.routes);
 					}	break;
 					case VALIDATION: {
 						/* test whether data matches, if not, either log
@@ -2603,8 +2350,7 @@ router_route_intern(
 									w->dests->cl->members.validation->rule,
 									firstspace + 1,
 									lastchr,
-									pmatch,
-									dispatcher_id))
+									pmatch))
 							break;
 
 						if (w->dests->cl->members.validation->action == VAL_LOG)
@@ -2653,14 +2399,13 @@ router_route(
 		size_t retsize,
 		char *srcaddr,
 		char *metric,
-		char *firstspace,
-		int dispatcher_id)
+		char *firstspace)
 {
 	size_t curlen = 0;
 	char blackholed = 0;
 
 	(void)router_route_intern(&blackholed, ret, &curlen, retsize, srcaddr,
-			metric, firstspace, rtr->routes, dispatcher_id);
+			metric, firstspace, rtr->routes);
 
 	*retcnt = curlen;
 	return blackholed;
@@ -2692,7 +2437,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 					w->dests->cl->members.routes);
 			if (gotmatch & 2)
 				break;
-		} else if (router_metric_matches(w, metric, firstspace, pmatch, 0)) {
+		} else if (router_metric_matches(w, metric, firstspace, pmatch)) {
 			gotmatch = 1;
 			switch (w->dests->cl->type) {
 				case AGGREGATION:
@@ -2705,7 +2450,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 				case STATSTUB: {
 					gotmatch |= router_test_intern(
 							metric + strlen(w->pattern),
-							firstspace,
+							firstspace + strlen(w->pattern),
 							w->dests->cl->members.routes);
 					return gotmatch;
 				}	break;
@@ -2871,34 +2616,16 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 								"jump_fnv1a", d->cl->name);
 						if (gotmatch & 4)
 							break;
-						if (w->masq != NULL) {
-							if ((len = router_rewrite_metric(
-										&newmetric, &newfirstspace,
-										metric, firstspace,
-										w->masq,
-										w->nmatch, pmatch)) == 0)
-							{
-								fprintf(stderr, "router_test: failed to "
-										"route using: "
-										"newmetric size too small to hold "
-										"replacement (%s -> %s)\n",
-										metric, w->masq);
-								break;
-							}
-							fprintf(stdout, "        using(%s) -> %s\n",
-									w->masq, newmetric);
-						}
 						if (mode & MODE_DEBUG) {
 							fprintf(stdout, "        hash_pos(%d)\n",
 									ch_gethashpos(d->cl->members.ch->ring,
-										w->masq ? newmetric : metric,
-										w->masq ? newfirstspace : firstspace));
+										metric, firstspace));
 						}
 						ch_get_nodes(dst,
 								d->cl->members.ch->ring,
 								d->cl->members.ch->repl_factor,
-								w->masq ? newmetric : metric,
-								w->masq ? newfirstspace : firstspace);
+								metric,
+								firstspace);
 						for (i = 0; i < d->cl->members.ch->repl_factor; i++) {
 							fprintf(stdout, "        %s:%d\n",
 									serverip(dst[i].dest),
@@ -2936,8 +2663,7 @@ router_test_intern(char *metric, char *firstspace, route *routes)
 									d->cl->members.validation->rule,
 									firstspace + 1,
 									lastspc,
-									pmatch,
-									0))
+									pmatch))
 						{
 							fprintf(stdout, "        match\n");
 						} else {

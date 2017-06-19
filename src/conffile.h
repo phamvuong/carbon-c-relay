@@ -21,9 +21,6 @@
 #include "aggregator.h"
 #include "consistent-hash.h"
 #include "allocator.h"
-#include "receptor.h"
-
-#define GRAPHITE_PORT 2003
 
 enum clusttype {
 	BLACKHOLE,  /* /dev/null-like destination */
@@ -88,11 +85,10 @@ typedef struct _destinations {
 
 typedef struct _route {
 	char *pattern;    /* original regex input, used for printing only */
-	regex_t *rule;    /* regex per worker on metric, only if type == REGEX */
+	regex_t rule;     /* regex on metric, only if type == REGEX */
 	size_t nmatch;    /* number of match groups */
 	char *strmatch;   /* string to search for if type not REGEX or MATCHALL */
 	destinations *dests; /* where matches should go */
-	char *masq;       /* when set, what to feed to the hashfunc when routing */
 	char stop:1;      /* whether to continue matching rules after this one */
 	enum {
 		MATCHALL,     /* the '*', don't do anything, just match everything */
@@ -108,14 +104,13 @@ typedef struct _route {
 void router_yyerror(void *locp, void *, router *r, allocator *ra, allocator *pa, const char *msg);
 char *router_validate_address(router *rtr, char **retip, int *retport, void **retsaddr, void **rethint, char *ip, serv_ctype proto);
 char *router_validate_path(router *rtr, char *path);
-char *router_validate_expression(router *rtr, route **retr, char *pat);
+char *router_validate_expression(router *rtr, route **retr, char *pat, char subst);
 char *router_validate_cluster(router *rtr, cluster **retcl, char *cluster);
 char *router_add_server(router *ret, char *ip, int port, char *inst, serv_ctype proto, struct addrinfo *saddrs, struct addrinfo *hint, char useall, cluster *cl);
 char *router_add_cluster(router *r, cluster *cl);
 char *router_add_route(router *r, route *rte);
 char *router_add_aggregator(router *rtr, aggregator *a);
 char *router_add_stubroute(router *rtr, enum clusttype type, cluster *w, destinations *dw);
-char *router_add_listener(router *rtr, rcptr_lsnrtype ltype, rcptr_transport trnsp, serv_ctype ctype, char *ip, int port, struct addrinfo *saddrs);
 char *router_set_statistics(router *rtr, destinations *dsts);
 char *router_set_collectorvals(router *rtr, int val, char *prefix, col_mode m);
 

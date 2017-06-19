@@ -26,7 +26,7 @@
 
 typedef struct _server server;
 
-typedef enum { CON_TCP, CON_UDP, CON_PIPE, CON_FILE, CON_UNIX } serv_ctype;
+typedef enum { CON_TCP, CON_UDP, CON_PIPE, CON_FILE } serv_ctype;
 
 server *server_new(
 		const char *ip,
@@ -39,7 +39,6 @@ server *server_new(
 		int maxstalls,
 		unsigned short iotimeout,
 		unsigned int sockbufsize);
-char server_cmp(server *s, struct addrinfo *saddr, const char *ip);
 char server_start(server *s);
 void server_add_secondaries(server *d, server **sec, size_t cnt);
 void server_set_failover(server *d);

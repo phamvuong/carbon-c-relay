@@ -48,7 +48,7 @@
 extern int router_yydebug;
 #endif
 /* "%code requires" blocks.  */
-#line 11 "conffile.y" /* yacc.c:1909  */
+#line 9 "conffile.y" /* yacc.c:1909  */
 
 struct _clust {
 	enum clusttype t;
@@ -74,20 +74,8 @@ struct _agcomp {
 	char *metric;
 	struct _agcomp *next;
 };
-struct _lsnr {
-	rcptr_lsnrtype type;
-	rcptr_transport transport;
-	struct _rcptr *rcptr;
-};
-struct _rcptr {
-	serv_ctype ctype;
-	char *ip;
-	int port;
-	void *saddr;
-	struct _rcptr *next;
-};
 
-#line 91 "conffile.tab.h" /* yacc.c:1909  */
+#line 79 "conffile.tab.h" /* yacc.c:1909  */
 
 /* Token type.  */
 #ifndef ROUTER_YYTOKENTYPE
@@ -113,55 +101,46 @@ struct _rcptr {
     crELSE = 274,
     crLOG = 275,
     crDROP = 276,
-    crROUTE = 277,
-    crUSING = 278,
-    crSEND = 279,
-    crTO = 280,
-    crBLACKHOLE = 281,
-    crSTOP = 282,
-    crREWRITE = 283,
-    crINTO = 284,
-    crAGGREGATE = 285,
-    crEVERY = 286,
-    crSECONDS = 287,
-    crEXPIRE = 288,
-    crAFTER = 289,
-    crTIMESTAMP = 290,
-    crAT = 291,
-    crSTART = 292,
-    crMIDDLE = 293,
-    crEND = 294,
-    crOF = 295,
-    crBUCKET = 296,
-    crCOMPUTE = 297,
-    crSUM = 298,
-    crCOUNT = 299,
-    crMAX = 300,
-    crMIN = 301,
-    crAVERAGE = 302,
-    crMEDIAN = 303,
-    crVARIANCE = 304,
-    crSTDDEV = 305,
-    crPERCENTILE = 306,
-    crWRITE = 307,
-    crSTATISTICS = 308,
-    crSUBMIT = 309,
-    crRESET = 310,
-    crCOUNTERS = 311,
-    crINTERVAL = 312,
-    crPREFIX = 313,
-    crWITH = 314,
-    crLISTEN = 315,
-    crLINEMODE = 316,
-    crGZIP = 317,
-    crBZIP2 = 318,
-    crLZMA = 319,
-    crSSL = 320,
-    crUNIX = 321,
-    crINCLUDE = 322,
-    crCOMMENT = 323,
-    crSTRING = 324,
-    crINTVAL = 325
+    crSEND = 277,
+    crTO = 278,
+    crBLACKHOLE = 279,
+    crSTOP = 280,
+    crREWRITE = 281,
+    crINTO = 282,
+    crAGGREGATE = 283,
+    crEVERY = 284,
+    crSECONDS = 285,
+    crEXPIRE = 286,
+    crAFTER = 287,
+    crTIMESTAMP = 288,
+    crAT = 289,
+    crSTART = 290,
+    crMIDDLE = 291,
+    crEND = 292,
+    crOF = 293,
+    crBUCKET = 294,
+    crCOMPUTE = 295,
+    crSUM = 296,
+    crCOUNT = 297,
+    crMAX = 298,
+    crMIN = 299,
+    crAVERAGE = 300,
+    crMEDIAN = 301,
+    crVARIANCE = 302,
+    crSTDDEV = 303,
+    crPERCENTILE = 304,
+    crWRITE = 305,
+    crSTATISTICS = 306,
+    crSUBMIT = 307,
+    crRESET = 308,
+    crCOUNTERS = 309,
+    crINTERVAL = 310,
+    crPREFIX = 311,
+    crWITH = 312,
+    crINCLUDE = 313,
+    crCOMMENT = 314,
+    crSTRING = 315,
+    crINTVAL = 316
   };
 #endif
 
@@ -177,8 +156,6 @@ union ROUTER_YYSTYPE
   char * crSTRING;
   /* cluster_opt_instance  */
   char * cluster_opt_instance;
-  /* match_opt_route  */
-  char * match_opt_route;
   /* statistics_opt_prefix  */
   char * statistics_opt_prefix;
   /* cluster  */
@@ -221,12 +198,8 @@ union ROUTER_YYSTYPE
   int match_opt_stop;
   /* statistics_opt_interval  */
   int statistics_opt_interval;
-  /* transport_mode  */
-  rcptr_transport transport_mode;
   /* cluster_opt_proto  */
   serv_ctype cluster_opt_proto;
-  /* rcptr_proto  */
-  serv_ctype rcptr_proto;
   /* aggregate_comp_type  */
   struct _agcomp aggregate_comp_type;
   /* aggregate_computes  */
@@ -251,8 +224,6 @@ union ROUTER_YYSTYPE
   struct _clust cluster_type;
   /* cluster_file  */
   struct _clust cluster_file;
-  /* listener  */
-  struct _lsnr * listener;
   /* match_exprs  */
   struct _maexpr * match_exprs;
   /* match_exprs2  */
@@ -261,15 +232,15 @@ union ROUTER_YYSTYPE
   struct _maexpr * match_opt_expr;
   /* match_expr  */
   struct _maexpr * match_expr;
+  /* match_exprs_subst  */
+  struct _maexpr * match_exprs_subst;
+  /* match_subst_opt_expr  */
+  struct _maexpr * match_subst_opt_expr;
+  /* match_subst_expr  */
+  struct _maexpr * match_subst_expr;
   /* match_opt_validate  */
   struct _maexpr * match_opt_validate;
-  /* receptors  */
-  struct _rcptr * receptors;
-  /* opt_receptor  */
-  struct _rcptr * opt_receptor;
-  /* receptor  */
-  struct _rcptr * receptor;
-#line 273 "conffile.tab.h" /* yacc.c:1909  */
+#line 244 "conffile.tab.h" /* yacc.c:1909  */
 };
 
 typedef union ROUTER_YYSTYPE ROUTER_YYSTYPE;

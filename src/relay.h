@@ -18,9 +18,7 @@
 #ifndef HAVE_RELAY_H
 #define HAVE_RELAY_H 1
 
-#ifdef HAVE_CONFIG_H
-#include "config.h"
-#endif
+#define VERSION "3.0"
 
 #define METRIC_BUFSIZ 8192
 
@@ -30,7 +28,6 @@
 #define MODE_TEST       (1 << 2)
 #define MODE_DAEMON     (1 << 3)
 #define MODE_TRACE      (1 << 4)
-#define MODE_CONFIGTEST (1 << 5)
 extern unsigned char mode;
 
 #ifdef ENABLE_TRACE
@@ -46,18 +43,5 @@ enum logdst { LOGOUT, LOGERR };
 int relaylog(enum logdst dest, const char *fmt, ...);
 #define logout(args...) relaylog(LOGOUT, args)
 #define logerr(args...) relaylog(LOGERR, args)
-
-#define saddr_ntop(SADDR, BUF) { \
-	BUF[0] = '\0'; \
-	if ((SADDR)->ai_family == PF_INET) { \
-		inet_ntop((SADDR)->ai_family, \
-					&((struct sockaddr_in *)(SADDR)->ai_addr)->sin_addr, \
-					BUF, sizeof(BUF)); \
-	} else if ((SADDR)->ai_family == PF_INET6) { \
-		inet_ntop((SADDR)->ai_family, \
-					&((struct sockaddr_in6 *)(SADDR)->ai_addr)->sin6_addr, \
-					BUF, sizeof(BUF)); \
-	} \
-}
 
 #endif
